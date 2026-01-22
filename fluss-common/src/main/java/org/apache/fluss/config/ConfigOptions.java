@@ -627,6 +627,13 @@ public class ConfigOptions {
                                     + "This corresponds to the jute.maxbuffer property. "
                                     + "Default is 100MB to match the RPC frame length limit.");
 
+    public static final ConfigOption<String> ZOOKEEPER_AUTH_DIGEST =
+            key("zookeeper.client.auth-digest")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "TThe digest auth string is used for ZooKeeper authentication, like: username:password.");
+
     // ------------------------------------------------------------------------
     //  ConfigOptions for Log
     // ------------------------------------------------------------------------

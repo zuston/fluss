@@ -36,6 +36,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -104,6 +105,13 @@ public class ZooKeeperUtils {
             curatorFrameworkBuilder.connectionStateErrorPolicy(
                     new SessionConnectionStateErrorPolicy());
         }
+
+        configuration
+                .getOptional(ConfigOptions.ZOOKEEPER_AUTH_DIGEST)
+                .ifPresent(
+                        auth ->
+                                curatorFrameworkBuilder.authorization(
+                                        "digest", auth.getBytes(StandardCharsets.UTF_8)));
 
         ZKClientConfig zkClientConfig;
         Optional<String> configPath =
