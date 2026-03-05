@@ -306,7 +306,8 @@ public class RemoteLogManager implements Closeable {
                                     remoteLog,
                                     remoteLogStorage,
                                     coordinatorGateway,
-                                    clock);
+                                    clock,
+                                    maxUploadSegmentsPerTask);
                     LOG.info(
                             "Created a new remote log task for table-bucket{}: {} and getting scheduled",
                             tableBucket,
