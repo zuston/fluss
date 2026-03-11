@@ -30,6 +30,10 @@
     <artifactId>fluss-lake-iceberg</artifactId>
     <name>Fluss : Lake : Iceberg</name>
 
+    <properties>
+        <iceberg.version>1.10.1-qiyi-4</iceberg.version>
+    </properties>
+
     <packaging>jar</packaging>
     <dependencies>
         <dependency>
@@ -319,10 +323,6 @@
                                 </includes>
                             </artifactSet>
                             <relocations>
-                                <relocation>
-                                    <pattern>com.fasterxml.jackson</pattern>
-                                    <shadedPattern>org.apache.iceberg.shaded.com.fasterxml.jackson</shadedPattern>
-                                </relocation>
                                 <relocation>
                                     <pattern>org.apache.parquet</pattern>
                                     <shadedPattern>org.apache.iceberg.shaded.org.apache.parquet</shadedPattern>
