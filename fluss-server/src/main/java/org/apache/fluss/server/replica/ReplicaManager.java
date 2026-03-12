@@ -1061,10 +1061,14 @@ public class ReplicaManager {
             TableBucket tb = data.getTableBucket();
             try {
                 Replica replica = getReplicaOrException(tb);
+                // register replica to remote log manager first.
+                remoteLogManager.registerReplica(replica);
+
                 replica.makeLeader(data);
                 if (replica.isDataLakeEnabled()) {
                     updateWithLakeTableSnapshot(replica);
                 }
+
                 // start the remote log tiering tasks for leaders
                 remoteLogManager.startLogTiering(replica);
                 result.put(tb, new NotifyLeaderAndIsrResultForBucket(tb));
@@ -1915,7 +1919,8 @@ public class ReplicaManager {
                                 fatalErrorHandler,
                                 bucketMetricGroup,
                                 tableInfo,
-                                clock);
+                                clock,
+                                remoteLogManager);
                 if (!existingLogTabletOpt.isPresent()) {
                     localDiskManager.recordReplicaLoad(dataDir, isKvTable);
                 }
