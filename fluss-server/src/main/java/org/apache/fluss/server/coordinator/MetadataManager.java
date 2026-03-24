@@ -44,13 +44,13 @@ import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
-import org.apache.fluss.metadata.TablePartition;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.security.acl.FlussPrincipal;
 import org.apache.fluss.server.entity.TablePropertyChanges;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.data.DatabaseRegistration;
 import org.apache.fluss.server.zk.data.PartitionAssignment;
+import org.apache.fluss.server.zk.data.PartitionRegistration;
 import org.apache.fluss.server.zk.data.TableAssignment;
 import org.apache.fluss.server.zk.data.TableRegistration;
 import org.apache.fluss.shaded.zookeeper3.org.apache.zookeeper.KeeperException;
@@ -186,9 +186,9 @@ public class MetadataManager {
     /**
      * List the partitions of the given table.
      *
-     * <p>Return a map from partition name to partition id.
+     * @return a map from partition name to partition registration.
      */
-    public Map<String, Long> listPartitions(TablePath tablePath)
+    public Map<String, PartitionRegistration> listPartitions(TablePath tablePath)
             throws TableNotExistException, TableNotPartitionedException {
         return listPartitions(tablePath, null);
     }
@@ -196,9 +196,9 @@ public class MetadataManager {
     /**
      * List the partitions of the given table and partitionSpec.
      *
-     * <p>Return a map from partition name to partition id.
+     * @return a map from partition name to partition registration.
      */
-    public Map<String, Long> listPartitions(
+    public Map<String, PartitionRegistration> listPartitions(
             TablePath tablePath, ResolvedPartitionSpec partitionFilter)
             throws TableNotExistException, TableNotPartitionedException, InvalidPartitionException {
         TableInfo tableInfo = getTable(tablePath);
@@ -208,10 +208,10 @@ public class MetadataManager {
         }
         try {
             if (partitionFilter == null) {
-                return zookeeperClient.getPartitionNameAndIds(tablePath);
+                return zookeeperClient.getPartitionRegistrations(tablePath);
             } else {
 
-                return zookeeperClient.getPartitionNameAndIds(
+                return zookeeperClient.getPartitionRegistrations(
                         tablePath, tableInfo.getPartitionKeys(), partitionFilter);
             }
         } catch (Exception e) {
@@ -323,7 +323,12 @@ public class MetadataManager {
                     }
                     // register the table
                     zookeeperClient.registerTable(
-                            tablePath, TableRegistration.newTable(tableId, tableToCreate), false);
+                            tablePath,
+                            TableRegistration.newTable(
+                                    tableId,
+                                    zookeeperClient.getDefaultRemoteDataDir(),
+                                    tableToCreate),
+                            false);
                     return tableId;
                 },
                 "Fail to create table " + tablePath);
@@ -696,9 +701,9 @@ public class MetadataManager {
             ResolvedPartitionSpec partition,
             boolean ignoreIfExists) {
         String partitionName = partition.getPartitionName();
-        Optional<TablePartition> optionalTablePartition =
-                getOptionalTablePartition(tablePath, partitionName);
-        if (optionalTablePartition.isPresent()) {
+        Optional<PartitionRegistration> optionalPartitionRegistration =
+                getOptionalPartitionRegistration(tablePath, partitionName);
+        if (optionalPartitionRegistration.isPresent()) {
             if (ignoreIfExists) {
                 return;
             }
@@ -751,7 +756,12 @@ public class MetadataManager {
             long partitionId = zookeeperClient.getPartitionIdAndIncrement();
             // register partition assignments and partition metadata to zk in transaction
             zookeeperClient.registerPartitionAssignmentAndMetadata(
-                    partitionId, partitionName, partitionAssignment, tablePath, tableId);
+                    partitionId,
+                    partitionName,
+                    partitionAssignment,
+                    zookeeperClient.getDefaultRemoteDataDir(),
+                    tablePath,
+                    tableId);
             LOG.info(
                     "Register partition {} to zookeeper for table [{}].", partitionName, tablePath);
         } catch (KeeperException.NodeExistsException nodeExistsException) {
@@ -773,9 +783,9 @@ public class MetadataManager {
     public void dropPartition(
             TablePath tablePath, ResolvedPartitionSpec partition, boolean ignoreIfNotExists) {
         String partitionName = partition.getPartitionName();
-        Optional<TablePartition> optionalTablePartition =
-                getOptionalTablePartition(tablePath, partitionName);
-        if (!optionalTablePartition.isPresent()) {
+        Optional<PartitionRegistration> optionalPartitionRegistration =
+                getOptionalPartitionRegistration(tablePath, partitionName);
+        if (!optionalPartitionRegistration.isPresent()) {
             if (ignoreIfNotExists) {
                 return;
             }
@@ -797,7 +807,7 @@ public class MetadataManager {
         }
     }
 
-    private Optional<TablePartition> getOptionalTablePartition(
+    private Optional<PartitionRegistration> getOptionalPartitionRegistration(
             TablePath tablePath, String partitionName) {
         try {
             return zookeeperClient.getPartition(tablePath, partitionName);
