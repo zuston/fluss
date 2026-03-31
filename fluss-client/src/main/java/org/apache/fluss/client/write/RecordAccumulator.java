@@ -721,7 +721,8 @@ public final class RecordAccumulator {
                     break;
                 } else {
                     if (shouldStopDrainBatchesForBucket(first, tableBucket)) {
-                        break;
+                        // Buckets are independent — skip this one, keep draining others.
+                        continue;
                     }
                 }
 
