@@ -20,6 +20,7 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FlussRuntimeException;
@@ -103,6 +104,7 @@ public final class LogTablet {
     private volatile int tieredLogLocalSegments;
     private final Clock clock;
     private final boolean isChangeLog;
+    private final long logTtlMs;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -137,6 +139,7 @@ public final class LogTablet {
             WriterStateManager writerStateManager,
             LogFormat logFormat,
             int tieredLogLocalSegments,
+            long logTtlMs,
             boolean isChangelog,
             Clock clock) {
         this.physicalPath = physicalPath;
@@ -147,6 +150,7 @@ public final class LogTablet {
                 (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_CHECK_INTERVAL).toMillis();
         this.writerStateManager = writerStateManager;
         this.highWatermarkMetadata = new LogOffsetMetadata(0L);
+        this.logTtlMs = logTtlMs;
 
         this.scheduler = scheduler;
         // scheduler the writer expiration interval check.
@@ -299,6 +303,7 @@ public final class LogTablet {
             Scheduler scheduler,
             LogFormat logFormat,
             int tieredLogLocalSegments,
+            long logTtlMs,
             boolean isChangelog,
             Clock clock,
             boolean isCleanShutdown)
@@ -346,8 +351,38 @@ public final class LogTablet {
                 writerStateManager,
                 logFormat,
                 tieredLogLocalSegments,
+                logTtlMs,
                 isChangelog,
                 clock);
+    }
+
+    @VisibleForTesting
+    public static LogTablet create(
+            PhysicalTablePath tablePath,
+            File tabletDir,
+            Configuration conf,
+            TabletServerMetricGroup serverMetricGroup,
+            long recoveryPoint,
+            Scheduler scheduler,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            boolean isChangelog,
+            Clock clock,
+            boolean isCleanShutdown)
+            throws Exception {
+        return create(
+                tablePath,
+                tabletDir,
+                conf,
+                serverMetricGroup,
+                recoveryPoint,
+                scheduler,
+                logFormat,
+                tieredLogLocalSegments,
+                new TableConfig(new Configuration()).getLogTTLMs(),
+                isChangelog,
+                clock,
+                isCleanShutdown);
     }
 
     /** Register metrics for this log tablet in the metric group. */
@@ -886,6 +921,32 @@ public final class LogTablet {
         }
     }
 
+    /**
+     * Rolls the active segment if it is non-empty and all of its records have passed the log TTL.
+     *
+     * <p>This keeps an empty active segment available for future appends while making the expired
+     * segment eligible for remote tiering and local cleanup.
+     */
+    public void rollActiveSegmentIfExpired() throws Exception {
+        if (logTtlMs <= 0L) {
+            return;
+        }
+
+        synchronized (lock) {
+            LogSegment activeSegment = localLog.getSegments().activeSegment();
+            if (activeSegment.getSizeInBytes() == 0
+                    || !isSegmentExpired(clock.milliseconds(), activeSegment)) {
+                return;
+            }
+
+            LOG.info(
+                    "Rolling expired active log segment {} for bucket {}.",
+                    activeSegment,
+                    getTableBucket());
+            roll(Optional.empty());
+        }
+    }
+
     /** Truncate this log so that it ends with the greatest offset < targetOffset. */
     boolean truncateTo(long targetOffset) throws LogStorageException {
         if (targetOffset < 0) {
@@ -1143,7 +1204,7 @@ public final class LogTablet {
     }
 
     /** Returns the segments that can be deleted by checking log end offset. */
-    private List<LogSegment> deletableSegments(long endOffset) {
+    private List<LogSegment> deletableSegments(long endOffset) throws IOException {
         if (localLog.getSegments().isEmpty()) {
             return Collections.emptyList();
         }
@@ -1152,15 +1213,25 @@ public final class LogTablet {
         // readers is in progress.
         List<LogSegment> deletableSegments = new ArrayList<>();
         List<LogSegment> logSegments = localLog.getSegments().values();
-        // ignore the segments configured to be retained
-        for (int i = 0; i < logSegments.size() - tieredLogLocalSegments; i++) {
-            if (logSegments.get(i + 1).getBaseOffset() <= endOffset) {
-                deletableSegments.add(logSegments.get(i));
-            } else {
+        int tierProtectedStartIndex = logSegments.size() - tieredLogLocalSegments;
+        long now = clock.milliseconds();
+
+        for (int i = 0; i < logSegments.size() - 1; i++) {
+            if (logSegments.get(i + 1).getBaseOffset() > endOffset) {
                 break;
+            }
+            if (i < tierProtectedStartIndex || isSegmentExpired(now, logSegments.get(i))) {
+                deletableSegments.add(logSegments.get(i));
             }
         }
         return deletableSegments;
+    }
+
+    private boolean isSegmentExpired(long now, LogSegment segment) throws IOException {
+        if (logTtlMs <= 0L) {
+            return false;
+        }
+        return now - segment.maxTimestampSoFar() > logTtlMs;
     }
 
     private void deleteSegments(List<LogSegment> deletableSegments, SegmentDeletionReason reason)
