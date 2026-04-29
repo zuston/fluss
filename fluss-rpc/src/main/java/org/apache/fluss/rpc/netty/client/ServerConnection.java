@@ -103,12 +103,13 @@ final class ServerConnection {
     ServerConnection(
             Bootstrap bootstrap,
             ServerNode node,
+            String connectionMetricId,
             ClientMetricGroup clientMetricGroup,
             ClientAuthenticator authenticator,
             BiConsumer<ServerConnection, Throwable> closeCallback) {
         this.node = node;
         this.state = ConnectionState.CONNECTING;
-        this.connectionMetrics = clientMetricGroup.createConnectionMetricGroup(node.uid());
+        this.connectionMetrics = clientMetricGroup.createConnectionMetricGroup(connectionMetricId);
         this.authenticator = authenticator;
         this.backoff = new ExponentialBackoff(100L, 2, 5000L, 0.2);
         whenClose(closeCallback);

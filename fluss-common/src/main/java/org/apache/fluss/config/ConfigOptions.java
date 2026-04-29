@@ -941,6 +941,15 @@ public class ConfigOptions {
                             "The number of threads that the client uses for sending requests to the "
                                     + "network and receiving responses from network. The default value is 4");
 
+    public static final ConfigOption<Integer> NETTY_CLIENT_NUM_CONNECTIONS_PER_SERVER =
+            key("netty.client.num-connections-per-server")
+                    .intType()
+                    .defaultValue(1)
+                    .withDescription(
+                            "The number of connections that the client opens to each server. "
+                                    + "Increasing this value can distribute requests from the same "
+                                    + "client across more server request processor threads.");
+
     public static final ConfigOption<Boolean> NETTY_CLIENT_ALLOCATOR_HEAP_BUFFER_FIRST =
             key("netty.client.allocator.heap-buffer-first")
                     .booleanType()

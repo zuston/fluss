@@ -124,6 +124,7 @@ public class ServerConnectionTest {
                 new ServerConnection(
                         bootstrap,
                         serverNode,
+                        serverNode.uid(),
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {});
@@ -156,10 +157,20 @@ public class ServerConnectionTest {
         ClientMetricGroup client = new ClientMetricGroup(metricRegistry, "client");
         ServerConnection connection =
                 new ServerConnection(
-                        bootstrap, serverNode, client, clientAuthenticator, (con, ignore) -> {});
+                        bootstrap,
+                        serverNode,
+                        serverNode.uid(),
+                        client,
+                        clientAuthenticator,
+                        (con, ignore) -> {});
         ServerConnection connection2 =
                 new ServerConnection(
-                        bootstrap, serverNode2, client, clientAuthenticator, (con, ignore) -> {});
+                        bootstrap,
+                        serverNode2,
+                        serverNode2.uid(),
+                        client,
+                        clientAuthenticator,
+                        (con, ignore) -> {});
         LookupRequest request = new LookupRequest().setTableId(1);
         PbLookupReqForBucket pbLookupReqForBucket = request.addBucketsReq();
         pbLookupReqForBucket.setBucketId(1);
@@ -213,6 +224,7 @@ public class ServerConnectionTest {
                 new ServerConnection(
                         mockBootstrap,
                         wrongServerTypeNode,
+                        wrongServerTypeNode.uid(),
                         TestingClientMetricGroup.newInstance(),
                         clientAuthenticator,
                         (con, ignore) -> {});

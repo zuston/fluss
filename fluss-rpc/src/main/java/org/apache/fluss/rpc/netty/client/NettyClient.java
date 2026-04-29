@@ -41,13 +41,16 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
+import static org.apache.fluss.utils.MathUtils.toPositive;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 
 /**
@@ -67,19 +70,20 @@ public final class NettyClient implements RpcClient {
 
     /**
      * Managed connections to Netty servers. The key is the server uid (e.g., "cs-2", "ts-3"), the
-     * value is the connection.
+     * value is the connection pool for the server.
      */
-    private final Map<String, ServerConnection> connections;
+    private final Map<String, ServerConnectionPool> connectionPools;
 
     /** Metric groups for client. */
     private final ClientMetricGroup clientMetricGroup;
 
     private final Supplier<ClientAuthenticator> authenticatorSupplier;
+    private final int numConnectionsPerServer;
 
     private volatile boolean isClosed = false;
 
     public NettyClient(Configuration conf, ClientMetricGroup clientMetricGroup) {
-        this.connections = new ConcurrentHashMap<>();
+        this.connectionPools = new ConcurrentHashMap<>();
 
         // build bootstrap
         this.eventGroup =
@@ -103,6 +107,12 @@ public final class NettyClient implements RpcClient {
                         .handler(new ClientChannelInitializer(connectionMaxIdle, preferHeap));
         this.clientMetricGroup = clientMetricGroup;
         this.authenticatorSupplier = AuthenticationFactory.loadClientAuthenticatorSupplier(conf);
+        this.numConnectionsPerServer =
+                conf.getInt(ConfigOptions.NETTY_CLIENT_NUM_CONNECTIONS_PER_SERVER);
+        checkArgument(
+                numConnectionsPerServer > 0,
+                "%s must be greater than 0.",
+                ConfigOptions.NETTY_CLIENT_NUM_CONNECTIONS_PER_SERVER.key());
         NettyMetrics.registerNettyMetrics(clientMetricGroup, allocator);
     }
 
@@ -116,7 +126,7 @@ public final class NettyClient implements RpcClient {
     @Override
     public boolean connect(ServerNode node) {
         checkArgument(!isClosed, "Netty client is closed.");
-        return getOrCreateConnection(node).isReady();
+        return getOrCreateConnectionPool(node).connect();
     }
 
     /**
@@ -130,9 +140,9 @@ public final class NettyClient implements RpcClient {
     public CompletableFuture<Void> disconnect(String serverUid) {
         LOG.debug("Disconnecting from server {}.", serverUid);
         checkArgument(!isClosed, "Netty client is closed.");
-        ServerConnection connection = connections.remove(serverUid);
-        if (connection != null) {
-            return connection.close();
+        ServerConnectionPool connectionPool = connectionPools.remove(serverUid);
+        if (connectionPool != null) {
+            return connectionPool.close();
         }
         return FutureUtils.completedVoidFuture();
     }
@@ -146,11 +156,11 @@ public final class NettyClient implements RpcClient {
     @Override
     public boolean isReady(String serverUid) {
         checkArgument(!isClosed, "Netty client is closed.");
-        ServerConnection connection = connections.get(serverUid);
-        if (connection == null) {
+        ServerConnectionPool connectionPool = connectionPools.get(serverUid);
+        if (connectionPool == null) {
             return false;
         }
-        return connection.isReady();
+        return connectionPool.isReady();
     }
 
     /** Send an RPC request to the given server and return a future for the response. */
@@ -158,7 +168,7 @@ public final class NettyClient implements RpcClient {
     public CompletableFuture<ApiMessage> sendRequest(
             ServerNode node, ApiKeys apiKey, ApiMessage request) {
         checkArgument(!isClosed, "Netty client is closed.");
-        return getOrCreateConnection(node).send(apiKey, request);
+        return getOrCreateConnectionPool(node).send(apiKey, request);
     }
 
     @Override
@@ -166,8 +176,8 @@ public final class NettyClient implements RpcClient {
         try {
             isClosed = true;
             final List<CompletableFuture<Void>> shutdownFutures = new ArrayList<>();
-            for (Map.Entry<String, ServerConnection> conn : connections.entrySet()) {
-                if (connections.remove(conn.getKey(), conn.getValue())) {
+            for (Map.Entry<String, ServerConnectionPool> conn : connectionPools.entrySet()) {
+                if (connectionPools.remove(conn.getKey(), conn.getValue())) {
                     shutdownFutures.add(conn.getValue().close());
                 }
             }
@@ -180,23 +190,146 @@ public final class NettyClient implements RpcClient {
         }
     }
 
-    private ServerConnection getOrCreateConnection(ServerNode node) {
+    private ServerConnectionPool getOrCreateConnectionPool(ServerNode node) {
         String serverId = node.uid();
-        return connections.computeIfAbsent(
+        return connectionPools.computeIfAbsent(
                 serverId,
                 ignored -> {
-                    LOG.debug("Creating connection to server {}.", node);
-                    return new ServerConnection(
-                            bootstrap,
+                    LOG.debug(
+                            "Creating connection pool to server {} with {} connections.",
                             node,
-                            clientMetricGroup,
-                            authenticatorSupplier.get(),
-                            (con, ignore) -> connections.remove(serverId, con));
+                            numConnectionsPerServer);
+                    return new ServerConnectionPool(node);
                 });
     }
 
     @VisibleForTesting
     Map<String, ServerConnection> connections() {
+        Map<String, ServerConnection> connections = new HashMap<>();
+        for (Map.Entry<String, ServerConnectionPool> entry : connectionPools.entrySet()) {
+            entry.getValue().copyConnectionsTo(entry.getKey(), connections);
+        }
         return connections;
+    }
+
+    private final class ServerConnectionPool {
+        private final ServerNode node;
+        private final String serverId;
+        private final ServerConnection[] connections;
+        private final AtomicInteger nextConnectionIndex = new AtomicInteger();
+
+        private ServerConnectionPool(ServerNode node) {
+            this.node = node;
+            this.serverId = node.uid();
+            this.connections = new ServerConnection[numConnectionsPerServer];
+        }
+
+        private boolean connect() {
+            return connectionForRequest().isReady();
+        }
+
+        private CompletableFuture<ApiMessage> send(ApiKeys apiKey, ApiMessage request) {
+            return connectionForRequest().send(apiKey, request);
+        }
+
+        private synchronized boolean isReady() {
+            for (ServerConnection connection : connections) {
+                if (connection != null && connection.isReady()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private ServerConnection connectionForRequest() {
+            int startIndex = toPositive(nextConnectionIndex.getAndIncrement()) % connections.length;
+            synchronized (this) {
+                for (int i = 0; i < connections.length; i++) {
+                    int index = (startIndex + i) % connections.length;
+                    if (connections[index] == null) {
+                        connections[index] = createConnection(index);
+                        return connections[index];
+                    }
+                }
+
+                for (int i = 0; i < connections.length; i++) {
+                    int index = (startIndex + i) % connections.length;
+                    if (connections[index].isReady()) {
+                        return connections[index];
+                    }
+                }
+
+                return connections[startIndex];
+            }
+        }
+
+        private ServerConnection createConnection(int index) {
+            LOG.debug("Creating connection {} to server {}.", index, node);
+            return new ServerConnection(
+                    bootstrap,
+                    node,
+                    connectionKey(serverId, index),
+                    clientMetricGroup,
+                    authenticatorSupplier.get(),
+                    (con, ignore) -> removeConnection(index, con));
+        }
+
+        private void removeConnection(int index, ServerConnection connection) {
+            synchronized (this) {
+                if (connections[index] == connection) {
+                    connections[index] = null;
+                }
+                if (!hasConnections()) {
+                    connectionPools.remove(serverId, this);
+                }
+            }
+        }
+
+        private CompletableFuture<Void> close() {
+            List<ServerConnection> connectionsToClose = new ArrayList<>();
+            synchronized (this) {
+                for (int i = 0; i < connections.length; i++) {
+                    if (connections[i] != null) {
+                        connectionsToClose.add(connections[i]);
+                        connections[i] = null;
+                    }
+                }
+            }
+
+            if (connectionsToClose.isEmpty()) {
+                return FutureUtils.completedVoidFuture();
+            }
+
+            List<CompletableFuture<Void>> closeFutures = new ArrayList<>(connectionsToClose.size());
+            for (ServerConnection connection : connectionsToClose) {
+                closeFutures.add(connection.close());
+            }
+            return FutureUtils.completeAll(closeFutures);
+        }
+
+        private synchronized void copyConnectionsTo(
+                String serverId, Map<String, ServerConnection> target) {
+            for (int i = 0; i < connections.length; i++) {
+                if (connections[i] != null) {
+                    target.put(connectionKey(serverId, i), connections[i]);
+                }
+            }
+        }
+
+        private boolean hasConnections() {
+            for (ServerConnection connection : connections) {
+                if (connection != null) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private String connectionKey(String serverId, int index) {
+            if (index == 0) {
+                return serverId;
+            }
+            return serverId + "#" + index;
+        }
     }
 }

@@ -140,6 +140,28 @@ final class NettyClientTest {
     }
 
     @Test
+    void testMultipleConnectionsPerServer() throws Exception {
+        nettyClient.close();
+        conf.setInt(ConfigOptions.NETTY_CLIENT_NUM_CONNECTIONS_PER_SERVER, 3);
+        nettyClient = new NettyClient(conf, TestingClientMetricGroup.newInstance());
+
+        List<CompletableFuture<ApiMessage>> futures = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            ApiVersionsRequest request =
+                    new ApiVersionsRequest()
+                            .setClientSoftwareName("testing_client" + i)
+                            .setClientSoftwareVersion("1.0");
+            futures.add(nettyClient.sendRequest(serverNode, ApiKeys.API_VERSIONS, request));
+        }
+
+        FutureUtils.waitForAll(futures).get();
+        assertThat(nettyClient.connections()).hasSize(3);
+        assertThat(nettyClient.connections().values())
+                .allSatisfy(
+                        connection -> assertThat(connection.getServerNode()).isEqualTo(serverNode));
+    }
+
+    @Test
     void testServerDisconnection() throws Exception {
         ApiVersionsRequest request =
                 new ApiVersionsRequest()
