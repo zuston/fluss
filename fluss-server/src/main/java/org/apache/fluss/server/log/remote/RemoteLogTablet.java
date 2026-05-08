@@ -121,6 +121,14 @@ public class RemoteLogTablet {
                     }
                     MetricGroup metricGroup = bucketMetricGroup.addGroup("remoteLog");
                     metricGroup.gauge(MetricNames.LOG_NUM_SEGMENTS, () -> numRemoteLogSegments);
+                    metricGroup.gauge(
+                            MetricNames.LOG_START_OFFSET,
+                            () -> {
+                                if (remoteLogStartOffset == INIT_REMOTE_LOG_START_OFFSET) {
+                                    return -1L;
+                                }
+                                return remoteLogStartOffset;
+                            });
                     metricGroup.gauge(MetricNames.LOG_END_OFFSET, () -> remoteLogEndOffset);
                     metricGroup.gauge(MetricNames.REMOTE_LOG_SIZE, this::getRemoteSizeInBytes);
                     remoteLogMetrics = metricGroup;

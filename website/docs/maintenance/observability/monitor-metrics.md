@@ -790,6 +790,11 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td>Gauge</td>
     </tr>
      <tr>
+      <td>startOffset</td>
+      <td>The start offset in local storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
       <td>endOffset</td>
       <td>The end offset in local storage for this table bucket.</td>
       <td>Gauge</td>
@@ -809,6 +814,11 @@ Some metrics might not be exposed when using other JVM implementations (e.g. IBM
       <td rowspan="3">table_bucket_remoteLog</td>
       <td>numSegments</td>
       <td>The number of segments in remote storage for this table bucket.</td>
+      <td>Gauge</td>
+    </tr>
+     <tr>
+      <td>startOffset</td>
+      <td>The start offset in remote storage for this table bucket.</td>
       <td>Gauge</td>
     </tr>
      <tr>
