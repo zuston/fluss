@@ -20,6 +20,7 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidRecordException;
@@ -180,7 +181,6 @@ public final class LogSegment {
                             + lazyOffsetIndex.file().getAbsolutePath()
                             + " does not exist.");
         }
-        lazyOffsetIndex.get().sanityCheck();
 
         if (!lazyTimeIndex.file().exists()) {
             throw new NoSuchFileException(
@@ -188,7 +188,10 @@ public final class LogSegment {
                             + lazyTimeIndex.file().getAbsolutePath()
                             + " does not exist.");
         }
-        lazyTimeIndex.get().sanityCheck();
+
+        // Sanity checks for time index and offset index are skipped because
+        // we will recover the segments above the recovery point in recoverLog()
+        // in any case so sanity checking them here is redundant.
     }
 
     /**
@@ -316,14 +319,17 @@ public final class LogSegment {
 
                 // The max timestamp is exposed at the batch level, so no need to iterate the
                 // records
-                if (batch.commitTimestamp() > maxTimestampSoFar()) {
+                if (batch.commitTimestamp() > maxTimestampAndStartOffsetSoFar.timestamp) {
                     maxTimestampAndStartOffsetSoFar =
                             new TimestampOffset(batch.commitTimestamp(), batch.baseLogOffset());
                 }
 
                 if (validBytes - lastIndexEntry > indexIntervalBytes) {
                     offsetIndex().append(batch.lastLogOffset(), validBytes);
-                    timeIndex().maybeAppend(maxTimestampSoFar(), startOffsetOfMaxTimestampSoFar());
+                    timeIndex()
+                            .maybeAppend(
+                                    maxTimestampAndStartOffsetSoFar.timestamp,
+                                    maxTimestampAndStartOffsetSoFar.offset);
                     lastIndexEntry = validBytes;
                 }
 
@@ -331,26 +337,27 @@ public final class LogSegment {
 
                 validBytes += batch.sizeInBytes();
             }
-        } catch (CorruptRecordException | InvalidRecordException e) {
+        } catch (CorruptRecordException
+                | InvalidRecordException
+                | CorruptMessageException
+                | IllegalArgumentException
+                | IndexOutOfBoundsException e) {
+            // Data corruption detected during recovery: CRC mismatch, invalid record format,
+            // or truncated batch from an interrupted write. Truncate from this point onward.
             LOG.warn(
-                    "Found invalid messages in log segment "
-                            + fileLogRecords.file().getAbsolutePath()
-                            + " at byte offset "
-                            + validBytes
-                            + ": "
-                            + e.getMessage()
-                            + ". "
-                            + e.getCause());
+                    "Found invalid messages in log segment {} at byte offset {}: {}. {}",
+                    fileLogRecords.file().getAbsolutePath(),
+                    validBytes,
+                    e.getMessage(),
+                    e.getCause());
         }
 
         int truncated = fileLogRecords.sizeInBytes() - validBytes;
         if (truncated > 0) {
             LOG.debug(
-                    "Truncated "
-                            + truncated
-                            + " invalid bytes at the end of segment "
-                            + fileLogRecords.file().getAbsolutePath()
-                            + " during recovery");
+                    "Truncated {} invalid bytes at the end of segment {} during recovery",
+                    truncated,
+                    fileLogRecords.file().getAbsolutePath());
         }
         fileLogRecords.truncateTo(validBytes);
         offsetIndex().trimToValidSize();
