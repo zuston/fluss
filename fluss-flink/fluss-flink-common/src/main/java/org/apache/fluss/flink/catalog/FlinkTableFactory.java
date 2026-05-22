@@ -144,6 +144,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions
                         .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
                         .toMillis();
+        int splitAssignmentBatchSize =
+                tableOptions.get(FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE);
 
         LeaseContext leaseContext = LeaseContext.fromConf(tableOptions);
         return new FlinkTableSource(
@@ -160,6 +162,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_INSERT_IF_NOT_EXISTS),
                 cache,
                 partitionDiscoveryIntervalMs,
+                splitAssignmentBatchSize,
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_DATALAKE_ENABLED)),
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_MERGE_ENGINE)),
                 context.getCatalogTable().getOptions(),
@@ -231,6 +234,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                                 FlinkConnectorOptions.SCAN_STARTUP_MODE,
                                 FlinkConnectorOptions.SCAN_STARTUP_TIMESTAMP,
                                 FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL,
+                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE,
                                 FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_ID,
                                 FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_DURATION,
                                 FlinkConnectorOptions.LOOKUP_ASYNC,
@@ -344,6 +348,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions
                         .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
                         .toMillis();
+        int splitAssignmentBatchSize =
+                tableOptions.get(FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE);
 
         return new ChangelogFlinkTableSource(
                 TablePath.of(tableIdentifier.getDatabaseName(), baseTableName),
@@ -353,6 +359,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 isStreamingMode,
                 startupOptions,
                 partitionDiscoveryIntervalMs,
+                splitAssignmentBatchSize,
                 catalogTableOptions);
     }
 
@@ -391,6 +398,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions
                         .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
                         .toMillis();
+        int splitAssignmentBatchSize =
+                tableOptions.get(FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE);
 
         return new BinlogFlinkTableSource(
                 TablePath.of(tableIdentifier.getDatabaseName(), baseTableName),
@@ -400,6 +409,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 isStreamingMode,
                 startupOptions,
                 partitionDiscoveryIntervalMs,
+                splitAssignmentBatchSize,
                 catalogTableOptions);
     }
 }

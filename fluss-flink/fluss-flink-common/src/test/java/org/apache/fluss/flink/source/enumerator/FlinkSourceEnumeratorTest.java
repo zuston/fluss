@@ -78,6 +78,7 @@ import java.util.stream.Collectors;
 import static org.apache.fluss.client.table.scanner.log.LogScanner.EARLIEST_OFFSET;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Unit tests for {@link FlinkSourceEnumerator}. */
 class FlinkSourceEnumeratorTest extends FlinkTestBase {
@@ -136,9 +137,75 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                 expectedAssignment.put(i, Collections.singletonList(genLogSplit(tableId, i)));
             }
 
-            Map<Integer, List<SourceSplitBase>> actualAssignment =
-                    getLastReadersAssignments(context);
+            Map<Integer, List<SourceSplitBase>> actualAssignment = getReadersAssignments(context);
             assertThat(actualAssignment).isEqualTo(expectedAssignment);
+        }
+    }
+
+    @Test
+    void testSplitAssignmentBatchSize() throws Throwable {
+        long tableId = createTable(DEFAULT_TABLE_PATH, DEFAULT_PK_TABLE_DESCRIPTOR);
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(1)) {
+            FlinkSourceEnumerator enumerator =
+                    new FlinkSourceEnumerator(
+                            DEFAULT_TABLE_PATH,
+                            flussConf,
+                            true,
+                            false,
+                            context,
+                            OffsetsInitializer.full(),
+                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                            2,
+                            streaming,
+                            null,
+                            null,
+                            LeaseContext.DEFAULT,
+                            false);
+
+            enumerator.start();
+            registerReader(context, enumerator, 0);
+            context.runNextOneTimeCallable();
+
+            List<SplitsAssignment<SourceSplitBase>> assignments =
+                    context.getSplitsAssignmentSequence();
+            assertThat(assignments).hasSize(2);
+            assertThat(assignments.get(0).assignment().get(0)).hasSize(2);
+            assertThat(assignments.get(1).assignment().get(0)).hasSize(1);
+
+            List<SourceSplitBase> assignedSplits = new ArrayList<>();
+            assignments.forEach(
+                    assignment -> assignedSplits.addAll(assignment.assignment().get(0)));
+            assertThat(assignedSplits)
+                    .containsExactly(
+                            genLogSplit(tableId, 0),
+                            genLogSplit(tableId, 1),
+                            genLogSplit(tableId, 2));
+        }
+    }
+
+    @Test
+    void testInvalidSplitAssignmentBatchSize() throws Exception {
+        try (MockSplitEnumeratorContext<SourceSplitBase> context =
+                new MockSplitEnumeratorContext<>(1)) {
+            assertThatThrownBy(
+                            () ->
+                                    new FlinkSourceEnumerator(
+                                            DEFAULT_TABLE_PATH,
+                                            flussConf,
+                                            true,
+                                            false,
+                                            context,
+                                            OffsetsInitializer.full(),
+                                            DEFAULT_SCAN_PARTITION_DISCOVERY_INTERVAL_MS,
+                                            0,
+                                            streaming,
+                                            null,
+                                            null,
+                                            LeaseContext.DEFAULT,
+                                            false))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("Split assignment batch size must be positive");
         }
     }
 
@@ -176,8 +243,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
             // make enumerate to get splits and assign
             context.runNextOneTimeCallable();
 
-            Map<Integer, List<SourceSplitBase>> actualAssignment =
-                    getLastReadersAssignments(context);
+            Map<Integer, List<SourceSplitBase>> actualAssignment = getReadersAssignments(context);
 
             Map<Integer, List<SourceSplitBase>> expectedAssignment = new HashMap<>();
 
@@ -263,8 +329,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                                 new LogSplit(new TableBucket(tableId, i), null, -2L)));
             }
 
-            Map<Integer, List<SourceSplitBase>> actualAssignment =
-                    getLastReadersAssignments(context);
+            Map<Integer, List<SourceSplitBase>> actualAssignment = getReadersAssignments(context);
             assertThat(actualAssignment).isEqualTo(expectedAssignment);
         }
     }
@@ -476,10 +541,11 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                     createPartitions(zooKeeperClient, DEFAULT_TABLE_PATH, newPartitions);
 
             /// invoke partition discovery callable again and there should assignments.
+            int assignmentStart = context.getSplitsAssignmentSequence().size();
             runPeriodicPartitionDiscovery(workExecutor);
 
             expectedAssignment = expectAssignments(enumerator, tableId, newPartitionNameIds);
-            actualAssignments = getLastReadersAssignments(context);
+            actualAssignments = getReadersAssignments(context, assignmentStart);
             checkAssignmentIgnoreOrder(actualAssignments, expectedAssignment);
 
             // drop + create partitions;
@@ -492,6 +558,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
                     createPartitions(zooKeeperClient, DEFAULT_TABLE_PATH, newPartitions);
 
             // invoke partition discovery callable again
+            assignmentStart = context.getSplitsAssignmentSequence().size();
             runPeriodicPartitionDiscovery(workExecutor);
 
             // there should be partition removed events
@@ -512,7 +579,7 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
 
             // check new assignments.
             expectedAssignment = expectAssignments(enumerator, tableId, newPartitionNameIds);
-            actualAssignments = getLastReadersAssignments(context);
+            actualAssignments = getReadersAssignments(context, assignmentStart);
             checkAssignmentIgnoreOrder(actualAssignments, expectedAssignment);
 
             Map<Long, String> assignedPartitions =
@@ -913,11 +980,21 @@ class FlinkSourceEnumeratorTest extends FlinkTestBase {
 
     private Map<Integer, List<SourceSplitBase>> getReadersAssignments(
             MockSplitEnumeratorContext<SourceSplitBase> context) {
+        return getReadersAssignments(context, 0);
+    }
+
+    private Map<Integer, List<SourceSplitBase>> getReadersAssignments(
+            MockSplitEnumeratorContext<SourceSplitBase> context, int startIndex) {
         List<SplitsAssignment<SourceSplitBase>> splitsAssignments =
                 context.getSplitsAssignmentSequence();
         Map<Integer, List<SourceSplitBase>> assignment = new HashMap<>();
-        for (SplitsAssignment<SourceSplitBase> splitAssignment : splitsAssignments) {
-            assignment.putAll(splitAssignment.assignment());
+        for (int i = startIndex; i < splitsAssignments.size(); i++) {
+            for (Map.Entry<Integer, List<SourceSplitBase>> splitAssignment :
+                    splitsAssignments.get(i).assignment().entrySet()) {
+                assignment
+                        .computeIfAbsent(splitAssignment.getKey(), key -> new ArrayList<>())
+                        .addAll(splitAssignment.getValue());
+            }
         }
         return assignment;
     }

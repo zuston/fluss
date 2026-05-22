@@ -69,6 +69,7 @@ public class FlussSourceBuilder<OUT> {
     private int[] projectedFields;
     private String[] projectedFieldNames;
     private Long scanPartitionDiscoveryIntervalMs;
+    private Integer splitPerAssignmentBatchSize;
     private OffsetsInitializer offsetsInitializer;
     private FlussDeserializationSchema<OUT> deserializationSchema;
 
@@ -128,6 +129,20 @@ public class FlussSourceBuilder<OUT> {
     public FlussSourceBuilder<OUT> setScanPartitionDiscoveryIntervalMs(
             long scanPartitionDiscoveryIntervalMs) {
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
+        return this;
+    }
+
+    /**
+     * Sets the maximum number of splits assigned to a reader in one assignment request.
+     *
+     * <p>If not specified, the default value from {@link
+     * FlinkConnectorOptions#SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE} is used.
+     *
+     * @param splitPerAssignmentBatchSize maximum splits per assignment request
+     * @return this builder
+     */
+    public FlussSourceBuilder<OUT> setSplitPerAssignmentBatchSize(int splitPerAssignmentBatchSize) {
+        this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         return this;
     }
 
@@ -224,6 +239,10 @@ public class FlussSourceBuilder<OUT> {
                             .defaultValue()
                             .toMillis();
         }
+        if (splitPerAssignmentBatchSize == null) {
+            splitPerAssignmentBatchSize =
+                    FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue();
+        }
 
         if (this.flussConf == null) {
             this.flussConf = new Configuration();
@@ -299,6 +318,7 @@ public class FlussSourceBuilder<OUT> {
                 projectedFields,
                 offsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
                 deserializationSchema,
                 true);
     }
