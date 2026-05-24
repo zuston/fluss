@@ -33,6 +33,7 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.config.cluster.ConfigEntry;
+import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.DatabaseAlreadyExistException;
 import org.apache.fluss.exception.DatabaseNotEmptyException;
 import org.apache.fluss.exception.DatabaseNotExistException;
@@ -1401,6 +1402,79 @@ class FlussAdminITCase extends ClientToServerITCaseBase {
                 },
                 Duration.ofMinutes(1),
                 "Get lakehouse info");
+    }
+
+    @Test
+    void testDynamicDiskWriteLimitRatio() throws Exception {
+        // Valid value should succeed
+        admin.alterClusterConfigs(
+                        Collections.singletonList(
+                                new AlterConfig(
+                                        ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO.key(),
+                                        "0.15",
+                                        AlterConfigOpType.SET)))
+                .get();
+        assertConfigEntry(
+                ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO.key(),
+                "0.15",
+                ConfigEntry.ConfigSource.DYNAMIC_SERVER_CONFIG);
+
+        // Invalid value: 0.0 (must be > 0.1)
+        assertThatThrownBy(
+                        () ->
+                                admin.alterClusterConfigs(
+                                                Collections.singletonList(
+                                                        new AlterConfig(
+                                                                ConfigOptions
+                                                                        .SERVER_DATA_DISK_WRITE_LIMIT_RATIO
+                                                                        .key(),
+                                                                "0.0",
+                                                                AlterConfigOpType.SET)))
+                                        .get())
+                .cause()
+                .isInstanceOf(ConfigException.class)
+                .hasMessageContaining("must be within (0.1, 1.0]");
+
+        // Invalid value: 0.1 (boundary, must be > 0.1)
+        assertThatThrownBy(
+                        () ->
+                                admin.alterClusterConfigs(
+                                                Collections.singletonList(
+                                                        new AlterConfig(
+                                                                ConfigOptions
+                                                                        .SERVER_DATA_DISK_WRITE_LIMIT_RATIO
+                                                                        .key(),
+                                                                "0.1",
+                                                                AlterConfigOpType.SET)))
+                                        .get())
+                .cause()
+                .isInstanceOf(ConfigException.class)
+                .hasMessageContaining("must be within (0.1, 1.0]");
+
+        // Invalid value: 1.5 (must be <= 1.0)
+        assertThatThrownBy(
+                        () ->
+                                admin.alterClusterConfigs(
+                                                Collections.singletonList(
+                                                        new AlterConfig(
+                                                                ConfigOptions
+                                                                        .SERVER_DATA_DISK_WRITE_LIMIT_RATIO
+                                                                        .key(),
+                                                                "1.5",
+                                                                AlterConfigOpType.SET)))
+                                        .get())
+                .cause()
+                .isInstanceOf(ConfigException.class)
+                .hasMessageContaining("must be within (0.1, 1.0]");
+
+        // Reset should succeed (restores default)
+        admin.alterClusterConfigs(
+                        Collections.singletonList(
+                                new AlterConfig(
+                                        ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO.key(),
+                                        null,
+                                        AlterConfigOpType.DELETE)))
+                .get();
     }
 
     private void assertConfigEntry(

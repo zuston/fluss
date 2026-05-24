@@ -252,6 +252,8 @@ public class TabletServer extends ServerBase {
 
             // Register kvManager to dynamicConfigManager for dynamic reconfiguration
             dynamicConfigManager.register(kvManager);
+            // Register localDiskManager for dynamic server.data-disk.write-limit-ratio
+            dynamicConfigManager.register(localDiskManager);
             // Start dynamicConfigManager after all reconfigurable components are registered
             dynamicConfigManager.startup();
 
@@ -299,7 +301,6 @@ public class TabletServer extends ServerBase {
                             ioExecutor,
                             localDiskManager);
             replicaManager.startup();
-
             this.tabletService =
                     new TabletService(
                             serverId,

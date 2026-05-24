@@ -20,12 +20,14 @@ package org.apache.fluss.rpc.protocol;
 import org.apache.fluss.exception.ApiException;
 import org.apache.fluss.exception.AuthenticationException;
 import org.apache.fluss.exception.AuthorizationException;
+import org.apache.fluss.exception.ConfigException;
 import org.apache.fluss.exception.CorruptMessageException;
 import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.DatabaseAlreadyExistException;
 import org.apache.fluss.exception.DatabaseNotEmptyException;
 import org.apache.fluss.exception.DatabaseNotExistException;
 import org.apache.fluss.exception.DeletionDisabledException;
+import org.apache.fluss.exception.DiskWriteLockedException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.FencedTieringEpochException;
@@ -247,6 +249,11 @@ public enum Errors {
             63,
             "The client has attempted to perform an operation with an invalid producer ID.",
             InvalidProducerIdException::new),
+    CONFIG_EXCEPTION(64, "A configuration error occurred.", ConfigException::new),
+    DISK_WRITE_LOCKED(
+            70,
+            "The tablet server has rejected writes because its data disk usage reached the configured write-limit ratio.",
+            DiskWriteLockedException::new),
     STORAGE_BACKPRESSURE_EXCEPTION(
             72,
             "The tablet server has rejected the write because the KV storage engine has reached its write-pressure threshold.",
