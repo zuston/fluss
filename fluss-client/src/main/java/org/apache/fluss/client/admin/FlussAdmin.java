@@ -47,6 +47,7 @@ import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metadata.TableStats;
 import org.apache.fluss.rpc.GatewayClientProxy;
+import org.apache.fluss.rpc.RetryableGatewayClientProxy;
 import org.apache.fluss.rpc.RpcClient;
 import org.apache.fluss.rpc.gateway.AdminGateway;
 import org.apache.fluss.rpc.gateway.AdminReadOnlyGateway;
@@ -97,6 +98,7 @@ import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 import org.apache.fluss.utils.MapUtils;
+import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
 import org.apache.fluss.utils.concurrent.FutureUtils;
 
 import javax.annotation.Nullable;
@@ -109,6 +111,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeAlterTableRequest;
 import static org.apache.fluss.client.utils.ClientRpcMessageUtils.makeCreatePartitionRequest;
@@ -136,13 +140,33 @@ public class FlussAdmin implements Admin {
     private final AdminReadOnlyGateway readOnlyGateway;
     private final MetadataUpdater metadataUpdater;
 
+    /**
+     * Single-thread executor that runs the metadata-refresh callback for {@link
+     * RetryableGatewayClientProxy}.
+     */
+    private final ExecutorService refreshExecutor =
+            Executors.newFixedThreadPool(
+                    1, new ExecutorThreadFactory("fluss-admin-metadata-refresh"));
+
     public FlussAdmin(RpcClient client, MetadataUpdater metadataUpdater) {
+        // TODO: AdminGateway includes non-idempotent write operations (createTable, dropTable,
+        //  createDatabase, etc.). Wrapping it with RetryableGatewayClientProxy is unsafe because
+        //  a request may succeed on the server while the response is lost (surfacing as a
+        //  RetriableException), causing a duplicate mutation on retry. A future phase should
+        //  introduce idempotent retry semantics (e.g., request-id deduplication) before enabling
+        //  retry on the write gateway.
         this.gateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getCoordinatorServer, client, AdminGateway.class);
-        this.readOnlyGateway =
+        AdminGateway rawReadOnlyGateway =
                 GatewayClientProxy.createGatewayProxy(
                         metadataUpdater::getRandomTabletServer, client, AdminGateway.class);
+        this.readOnlyGateway =
+                RetryableGatewayClientProxy.createRetryableGatewayProxy(
+                        rawReadOnlyGateway,
+                        metadataUpdater::refreshClusterUntilAvailable,
+                        refreshExecutor,
+                        AdminGateway.class);
         this.metadataUpdater = metadataUpdater;
     }
 
@@ -724,7 +748,9 @@ public class FlussAdmin implements Admin {
 
     @Override
     public void close() {
-        // nothing to do yet
+        // Stop the metadata-refresh executor; any in-flight refresh will be interrupted, which
+        // refreshClusterUntilAvailable handles by surfacing the InterruptedException upward.
+        refreshExecutor.shutdownNow();
     }
 
     private static Map<Integer, GetTableStatsRequest> prepareTableStatsRequests(
