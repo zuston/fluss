@@ -20,6 +20,7 @@ package org.apache.fluss.server.tablet;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.exception.AuthorizationException;
 import org.apache.fluss.exception.InvalidTableException;
+import org.apache.fluss.exception.StaleMetadataException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.fs.FileSystem;
 import org.apache.fluss.metadata.TableBucket;
@@ -31,9 +32,12 @@ import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.entity.PrefixLookupResultForBucket;
 import org.apache.fluss.rpc.entity.ProduceLogResultForBucket;
 import org.apache.fluss.rpc.entity.ResultForBucket;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
+import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetTableStatsRequest;
 import org.apache.fluss.rpc.messages.GetTableStatsResponse;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
@@ -149,6 +153,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     private final TabletServerMetadataCache metadataCache;
     private final TabletServerMetadataProvider metadataFunctionProvider;
     private final ExecutorService replicaStateChangeExecutor;
+    private final CoordinatorGateway coordinatorGateway;
+    private final String interListenerName;
 
     public TabletService(
             int serverId,
@@ -160,7 +166,9 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             @Nullable Authorizer authorizer,
             DynamicConfigManager dynamicConfigManager,
             ExecutorService ioExecutor,
-            ExecutorService replicaStateChangeExecutor) {
+            ExecutorService replicaStateChangeExecutor,
+            CoordinatorGateway coordinatorGateway,
+            String interListenerName) {
         super(
                 remoteFileSystem,
                 ServerType.TABLET_SERVER,
@@ -175,6 +183,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
         this.metadataFunctionProvider =
                 new TabletServerMetadataProvider(zkClient, metadataManager, metadataCache);
         this.replicaStateChangeExecutor = replicaStateChangeExecutor;
+        this.coordinatorGateway = coordinatorGateway;
+        this.interListenerName = interListenerName;
     }
 
     @Override
@@ -518,6 +528,29 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                 result ->
                         replicaManager.notifyLakeTableOffset(
                                 notifyLakeTableOffsetData, result::complete));
+    }
+
+    @Override
+    public CompletableFuture<GetClusterHealthResponse> getClusterHealth(
+            GetClusterHealthRequest request) {
+        // Tablet servers don't own the cluster-wide health view; we forward the call to the
+        // coordinator over the internal listener.
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+
+        if (metadataCache.getCoordinatorServer(interListenerName) == null) {
+            // Fail fast during the startup window before the tablet has received its first
+            // UpdateMetadataRequest from the coordinator. The supplier inside coordinatorGateway
+            // would otherwise block-and-retry, which is not what readiness probes want.
+            CompletableFuture<GetClusterHealthResponse> failed = new CompletableFuture<>();
+            failed.completeExceptionally(
+                    new StaleMetadataException(
+                            "Tablet server has not yet received coordinator metadata; cluster"
+                                    + " health is unavailable."));
+            return failed;
+        }
+        return coordinatorGateway.getClusterHealth(request);
     }
 
     private <T> CompletableFuture<T> submitReplicaStateChange(
