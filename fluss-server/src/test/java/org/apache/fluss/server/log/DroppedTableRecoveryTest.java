@@ -32,6 +32,7 @@ import org.apache.fluss.record.TestingSchemaGetter;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.KvTablet;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
@@ -69,6 +70,7 @@ final class DroppedTableRecoveryTest extends LogTestBase {
     private @TempDir File tempDir;
     private TablePath tablePath;
     private TableBucket tableBucket;
+    private LocalDiskManager localDiskManager;
     private LogManager logManager;
     private KvManager kvManager;
 
@@ -84,24 +86,31 @@ final class DroppedTableRecoveryTest extends LogTestBase {
     public void setup() throws Exception {
         super.before();
         conf.setString(ConfigOptions.DATA_DIR, tempDir.getAbsolutePath());
+        conf.set(ConfigOptions.TABLET_SERVER_ID, 1);
 
         String dbName = "test_db";
         tablePath = TablePath.of(dbName, "dropped_table");
         tableBucket = new TableBucket(DATA1_TABLE_ID, 1);
 
         registerTableInZkClient();
+        localDiskManager = LocalDiskManager.create(conf);
         logManager =
                 LogManager.create(
                         conf,
                         zkClient,
                         new FlussScheduler(1),
                         SystemClock.getInstance(),
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         logManager.startup();
 
         kvManager =
                 KvManager.create(
-                        conf, zkClient, logManager, TestingMetricGroups.TABLET_SERVER_METRICS);
+                        conf,
+                        zkClient,
+                        logManager,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         kvManager.startup();
     }
 
@@ -113,12 +122,15 @@ final class DroppedTableRecoveryTest extends LogTestBase {
     }
 
     @AfterEach
-    public void tearDown() {
+    public void tearDown() throws Exception {
         if (kvManager != null) {
             kvManager.shutdown();
         }
         if (logManager != null) {
             logManager.shutdown();
+        }
+        if (localDiskManager != null) {
+            localDiskManager.close();
         }
     }
 
@@ -130,10 +142,20 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         LogTablet log1 =
                 logManager.getOrCreateLog(
-                        PhysicalTablePath.of(tablePath), tableBucket1, LogFormat.ARROW, 1, false);
+                        tempDir,
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket1,
+                        LogFormat.ARROW,
+                        1,
+                        false);
         LogTablet log2 =
                 logManager.getOrCreateLog(
-                        PhysicalTablePath.of(tablePath), tableBucket2, LogFormat.ARROW, 1, false);
+                        tempDir,
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket2,
+                        LogFormat.ARROW,
+                        1,
+                        false);
 
         // Write some data to both logs
         MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
@@ -148,18 +170,21 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         // Shutdown log manager first
         logManager.shutdown();
+        localDiskManager.close();
 
         // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start LogManager again
+        localDiskManager = LocalDiskManager.create(conf);
         LogManager newLogManager =
                 LogManager.create(
                         conf,
                         zkClient,
                         new FlussScheduler(1),
                         SystemClock.getInstance(),
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         newLogManager.startup();
 
         // Verify that both residual data directories were cleaned up
@@ -178,7 +203,12 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         LogTablet log =
                 logManager.getOrCreateLog(
-                        partitionedTablePath, partitionedTableBucket, LogFormat.ARROW, 1, false);
+                        tempDir,
+                        partitionedTablePath,
+                        partitionedTableBucket,
+                        LogFormat.ARROW,
+                        1,
+                        false);
 
         // Write some data to the log
         MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
@@ -189,18 +219,21 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         // Shutdown log manager first
         logManager.shutdown();
+        localDiskManager.close();
 
         // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start LogManager again
+        localDiskManager = LocalDiskManager.create(conf);
         LogManager newLogManager =
                 LogManager.create(
                         conf,
                         zkClient,
                         new FlussScheduler(1),
                         SystemClock.getInstance(),
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         newLogManager.startup();
 
         // Verify that the residual data directory was cleaned up
@@ -217,10 +250,20 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         LogTablet log1 =
                 logManager.getOrCreateLog(
-                        PhysicalTablePath.of(tablePath), tableBucket1, LogFormat.ARROW, 1, false);
+                        tempDir,
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket1,
+                        LogFormat.ARROW,
+                        1,
+                        false);
         LogTablet log2 =
                 logManager.getOrCreateLog(
-                        PhysicalTablePath.of(tablePath), tableBucket2, LogFormat.ARROW, 1, false);
+                        tempDir,
+                        PhysicalTablePath.of(tablePath),
+                        tableBucket2,
+                        LogFormat.ARROW,
+                        1,
+                        false);
 
         // Write some data to both logs
         MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
@@ -260,23 +303,30 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         // Shutdown managers first
         kvManager.shutdown();
         logManager.shutdown();
+        localDiskManager.close();
 
         // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start managers again
+        localDiskManager = LocalDiskManager.create(conf);
         LogManager newLogManager =
                 LogManager.create(
                         conf,
                         zkClient,
                         new FlussScheduler(1),
                         SystemClock.getInstance(),
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         newLogManager.startup(); // Should clean up log directories
 
         KvManager newKvManager =
                 KvManager.create(
-                        conf, zkClient, newLogManager, TestingMetricGroups.TABLET_SERVER_METRICS);
+                        conf,
+                        zkClient,
+                        newLogManager,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         newKvManager.startup();
 
         // KV tablet directories should be cleaned up by LogManager automatically
@@ -300,7 +350,12 @@ final class DroppedTableRecoveryTest extends LogTestBase {
 
         LogTablet log =
                 logManager.getOrCreateLog(
-                        partitionedTablePath, partitionedTableBucket, LogFormat.ARROW, 1, false);
+                        tempDir,
+                        partitionedTablePath,
+                        partitionedTableBucket,
+                        LogFormat.ARROW,
+                        1,
+                        false);
 
         // Write some data to the log
         MemoryLogRecords records = genMemoryLogRecordsByObject(DATA1);
@@ -326,23 +381,30 @@ final class DroppedTableRecoveryTest extends LogTestBase {
         // Shutdown managers first
         kvManager.shutdown();
         logManager.shutdown();
+        localDiskManager.close();
 
         // Simulate table drop: remove metadata from ZooKeeper
         zkClient.deleteTable(tablePath);
 
         // Start managers again
+        localDiskManager = LocalDiskManager.create(conf);
         LogManager newLogManager =
                 LogManager.create(
                         conf,
                         zkClient,
                         new FlussScheduler(1),
                         SystemClock.getInstance(),
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         newLogManager.startup();
 
         KvManager newKvManager =
                 KvManager.create(
-                        conf, zkClient, newLogManager, TestingMetricGroups.TABLET_SERVER_METRICS);
+                        conf,
+                        zkClient,
+                        newLogManager,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         newKvManager.startup();
 
         // KV tablet directory should be cleaned up by LogManager automatically

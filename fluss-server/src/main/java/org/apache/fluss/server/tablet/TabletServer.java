@@ -49,6 +49,7 @@ import org.apache.fluss.server.metrics.ServerMetricUtils;
 import org.apache.fluss.server.metrics.UserMetrics;
 import org.apache.fluss.server.metrics.group.TabletServerMetricGroup;
 import org.apache.fluss.server.replica.ReplicaManager;
+import org.apache.fluss.server.storage.LocalDiskManager;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperUtils;
 import org.apache.fluss.server.zk.data.TabletServerRegistration;
@@ -144,6 +145,9 @@ public class TabletServer extends ServerBase {
     private KvManager kvManager;
 
     @GuardedBy("lock")
+    private LocalDiskManager localDiskManager;
+
+    @GuardedBy("lock")
     private ReplicaManager replicaManager;
 
     @GuardedBy("lock")
@@ -223,11 +227,20 @@ public class TabletServer extends ServerBase {
 
             this.metadataCache = new TabletServerMetadataCache(metadataManager);
 
+            this.localDiskManager = LocalDiskManager.create(conf);
             this.logManager =
-                    LogManager.create(conf, zkClient, scheduler, clock, tabletServerMetricGroup);
+                    LogManager.create(
+                            conf,
+                            zkClient,
+                            scheduler,
+                            clock,
+                            tabletServerMetricGroup,
+                            localDiskManager);
             logManager.startup();
 
-            this.kvManager = KvManager.create(conf, zkClient, logManager, tabletServerMetricGroup);
+            this.kvManager =
+                    KvManager.create(
+                            conf, zkClient, logManager, tabletServerMetricGroup, localDiskManager);
             kvManager.startup();
 
             // Register kvManager to dynamicConfigManager for dynamic reconfiguration
@@ -273,7 +286,8 @@ public class TabletServer extends ServerBase {
                             tabletServerMetricGroup,
                             userMetrics,
                             clock,
-                            ioExecutor);
+                            ioExecutor,
+                            localDiskManager);
             replicaManager.startup();
 
             this.tabletService =
@@ -442,6 +456,10 @@ public class TabletServer extends ServerBase {
 
                 if (replicaManager != null) {
                     replicaManager.shutdown();
+                }
+
+                if (localDiskManager != null) {
+                    localDiskManager.close();
                 }
 
                 if (authorizer != null) {

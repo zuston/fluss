@@ -53,6 +53,8 @@ import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metrics.group.BucketMetricGroup;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
+import org.apache.fluss.server.storage.LocalDiskManager;
+import org.apache.fluss.server.testutils.ServerTestTags;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
@@ -69,6 +71,7 @@ import org.apache.fluss.utils.function.ThrowingRunnable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -123,6 +126,7 @@ import static org.apache.fluss.utils.FlussPaths.remoteLogTabletDir;
  * function managed by {@link ReplicaManager}.
  */
 public class ReplicaTestBase {
+
     @RegisterExtension
     public static final AllCallbackWrapper<ZooKeeperExtension> ZOO_KEEPER_EXTENSION_WRAPPER =
             new AllCallbackWrapper<>(new ZooKeeperExtension());
@@ -136,6 +140,7 @@ public class ReplicaTestBase {
 
     protected @TempDir File tempDir;
     protected ManualClock manualClock;
+    protected LocalDiskManager localDiskManager;
     protected LogManager logManager;
     protected KvManager kvManager;
     protected ReplicaManager replicaManager;
@@ -167,9 +172,18 @@ public class ReplicaTestBase {
     }
 
     @BeforeEach
-    public void setup() throws Exception {
+    public void setup(TestInfo testInfo) throws Exception {
         conf = getServerConf();
-        conf.setString(ConfigOptions.DATA_DIR, tempDir.getAbsolutePath());
+        conf.set(ConfigOptions.TABLET_SERVER_ID, TABLET_SERVER_ID);
+        if (testInfo != null && testInfo.getTags().contains(ServerTestTags.JBOD_MULTI_DIR_TAG)) {
+            conf.set(
+                    ConfigOptions.DATA_DIRS,
+                    Arrays.asList(
+                            new File(tempDir, "data-1").getAbsolutePath(),
+                            new File(tempDir, "data-2").getAbsolutePath()));
+        } else {
+            conf.setString(ConfigOptions.DATA_DIR, tempDir.getAbsolutePath());
+        }
         conf.setString(ConfigOptions.COORDINATOR_HOST, "localhost");
         conf.set(ConfigOptions.REMOTE_DATA_DIR, tempDir.getAbsolutePath() + "/remote_data_dir");
         conf.set(ConfigOptions.SERVER_IO_POOL_SIZE, 2);
@@ -187,18 +201,24 @@ public class ReplicaTestBase {
         ioExecutor = Executors.newSingleThreadExecutor();
 
         manualClock = new ManualClock(System.currentTimeMillis());
+        localDiskManager = LocalDiskManager.create(conf);
         logManager =
                 LogManager.create(
                         conf,
                         zkClient,
                         scheduler,
                         manualClock,
-                        TestingMetricGroups.TABLET_SERVER_METRICS);
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         logManager.startup();
 
         kvManager =
                 KvManager.create(
-                        conf, zkClient, logManager, TestingMetricGroups.TABLET_SERVER_METRICS);
+                        conf,
+                        zkClient,
+                        logManager,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
         kvManager.startup();
 
         serverMetadataCache =
@@ -223,6 +243,10 @@ public class ReplicaTestBase {
         // We will register all tables in TestData in zk client previously.
         registerTableInZkClient();
     }
+
+    // Kept for subclasses that still define @BeforeEach setup() and call super.setup().
+    // The actual initialization already happens in setup(TestInfo).
+    protected void setup() throws Exception {}
 
     private void initMetadataCache(TabletServerMetadataCache metadataCache) {
         metadataCache.updateClusterMetadata(
@@ -316,7 +340,8 @@ public class ReplicaTestBase {
                 TestingMetricGroups.USER_METRICS,
                 remoteLogManager,
                 manualClock,
-                ioExecutor);
+                ioExecutor,
+                localDiskManager);
     }
 
     @AfterEach
@@ -349,6 +374,10 @@ public class ReplicaTestBase {
 
         if (scheduler != null) {
             scheduler.shutdown();
+        }
+
+        if (localDiskManager != null) {
+            localDiskManager.close();
         }
 
         if (ioExecutor != null) {
@@ -471,6 +500,7 @@ public class ReplicaTestBase {
                         .getServerMetricGroup()
                         .addTableBucketMetricGroup(physicalTablePath, tableBucket, isPkTable);
         return new Replica(
+                localDiskManager.selectDataDirForNewBucket(isPkTable),
                 physicalTablePath,
                 tableBucket,
                 logManager,
@@ -481,7 +511,7 @@ public class ReplicaTestBase {
                 new OffsetCheckpointFile.LazyOffsetCheckpoints(
                         new OffsetCheckpointFile(
                                 new File(
-                                        conf.getString(ConfigOptions.DATA_DIR),
+                                        localDiskManager.dataDirs().get(0),
                                         HIGH_WATERMARK_CHECKPOINT_FILE_NAME))),
                 replicaManager.getDelayedWriteManager(),
                 replicaManager.getDelayedFetchLogManager(),
@@ -502,6 +532,8 @@ public class ReplicaTestBase {
                         conf,
                         zkClient,
                         testCoordinatorGateway,
+                        localDiskManager,
+                        logManager,
                         remoteLogStorage,
                         remoteLogTaskScheduler,
                         manualClock);
