@@ -50,6 +50,19 @@
         <connection>git@github.com:apache/fluss.git</connection>
     </scm>
 
+    <distributionManagement>
+        <snapshotRepository>
+            <id>debug.repository.iqiyi.com</id>
+            <name>iQIYI Debug Repository</name>
+            <url>http://jfrog.cloud.qiyi.domain/iqiyi-maven-cloudservice</url>
+        </snapshotRepository>
+        <repository>
+            <id>release.repository.iqiyi.com</id>
+            <name>iQIYI Release Repository</name>
+            <url>http://jfrog.cloud.qiyi.domain/iqiyi-maven-cloudservice</url>
+        </repository>
+    </distributionManagement>
+
     <modules>
         <module>fluss-common</module>
         <module>fluss-metrics</module>
