@@ -405,7 +405,7 @@ public class TieringSourceEnumerator
                 currentFailedTableEpochs,
                 tieringTableEpochs);
 
-        if (pendingSplits.isEmpty() && !readersAwaitingSplit.isEmpty()) {
+        if (canRequestNewTieringTable()) {
             LakeTieringHeartbeatResponse heartbeatResponse =
                     waitHeartbeatResponse(
                             coordinatorGateway.lakeTieringHeartbeat(
@@ -419,6 +419,7 @@ public class TieringSourceEnumerator
                                 TablePath.of(
                                         tieringTable.getTablePath().getDatabaseName(),
                                         tieringTable.getTablePath().getTableName()));
+                tieringTableEpochs.put(lakeTieringInfo.f0, lakeTieringInfo.f1);
                 LOG.info("Tiering table {} has been requested.", lakeTieringInfo);
             } else {
                 LOG.info("No available Tiering table found, will poll later.");
@@ -433,6 +434,10 @@ public class TieringSourceEnumerator
         currentFinishedTables.forEach(finishedTables::remove);
         currentFailedTableEpochs.forEach(failedTableEpochs::remove);
         return lakeTieringInfo;
+    }
+
+    private boolean canRequestNewTieringTable() {
+        return pendingSplits.isEmpty() && !readersAwaitingSplit.isEmpty();
     }
 
     private void generateTieringSplits(Tuple3<Long, Long, TablePath> tieringTable)
@@ -459,9 +464,9 @@ public class TieringSourceEnumerator
                 LOG.info(
                         "Generate Tiering splits for table {} is empty, no need to tier data.",
                         tieringTable.f2.getTableName());
+                tieringTableEpochs.remove(tieringTable.f0, tieringTable.f1);
                 finishedTables.put(tieringTable.f0, TieringFinishInfo.from(tieringTable.f1));
             } else {
-                tieringTableEpochs.put(tieringTable.f0, tieringTable.f1);
                 pendingSplits.addAll(tieringSplits);
 
                 timerService.schedule(
@@ -479,6 +484,7 @@ public class TieringSourceEnumerator
             }
         } catch (Exception e) {
             LOG.warn("Fail to generate Tiering splits for table {}.", tieringTable.f2, e);
+            tieringTableEpochs.remove(tieringTable.f0, tieringTable.f1);
             failedTableEpochs.put(tieringTable.f0, tieringTable.f1);
         }
     }
