@@ -80,7 +80,9 @@ abstract class HybridLakeLookupITCase extends AbstractTestBase {
                             new Configuration()
                                     .set(ConfigOptions.KV_MAX_RETAINED_SNAPSHOTS, Integer.MAX_VALUE)
                                     .set(ConfigOptions.TABLE_DATALAKE_ENABLED, true)
-                                    .set(ConfigOptions.TABLE_DATALAKE_FORMAT, DataLakeFormat.PAIMON))
+                                    .set(
+                                            ConfigOptions.TABLE_DATALAKE_FORMAT,
+                                            DataLakeFormat.PAIMON))
                     .setNumOfTabletServers(3)
                     .setClock(CLOCK)
                     .build();

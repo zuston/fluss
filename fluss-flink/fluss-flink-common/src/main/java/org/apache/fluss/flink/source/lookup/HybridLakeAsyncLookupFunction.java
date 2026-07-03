@@ -33,20 +33,19 @@ import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.flink.utils.FlussRowToFlinkRowConverter;
+import org.apache.fluss.lake.source.LakeLookup;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.lake.source.Planner;
-import org.apache.fluss.lake.source.RecordReader;
+import org.apache.fluss.lake.source.SupportsLakeLookup;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.predicate.PredicateBuilder;
-import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
 import org.apache.fluss.types.DataTypeRoot;
-import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.PartitionUtils;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
@@ -121,6 +120,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private transient InternalRow.FieldGetter[] primaryKeyFieldGetters;
     private transient int autoPartitionKeyPositionInPrimaryKey;
     private transient org.apache.fluss.types.RowType flussFullRowType;
+    private transient LakeLookup<LakeSplit> lakeLookup;
     private transient ThreadPoolExecutor lakeLookupExecutor;
     private transient ScheduledExecutorService timeoutExecutor;
     private transient AtomicInteger lakeFallbackPendingCount;
@@ -187,6 +187,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         }
         flussRowToFlinkRowConverter =
                 new FlussRowToFlinkRowConverter(FlinkConversions.toFlussRowType(outputRowType));
+        lakeLookup = createLakeLookup();
 
         Lookup lookup = table.newLookup();
         lookuper = lookup.createLookuper();
@@ -351,9 +352,6 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 checkNotNull(
                         createLakeSource(tablePath, tableOptions),
                         "Lake source must not be null for lake fallback lookup.");
-        if (projection != null) {
-            lakeSource.withProject(toNestedProjection(projection));
-        }
         Predicate predicate = createPrimaryKeyPredicate(lookupKey.primaryKeyValues);
         LakeSource.FilterPushDownResult pushDownResult =
                 lakeSource.withFilters(Collections.singletonList(predicate));
@@ -361,25 +359,71 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             throw new TableException(
                     "Lake fallback lookup requires primary-key predicates to be pushed down.");
         }
-
         Planner<LakeSplit> planner = lakeSource.createPlanner(lakeSnapshot::getSnapshotId);
+        LOG.info(
+                "Planning lake lookup splits for table {}, snapshot {}, primary key indexes {}, primary key values {}.",
+                tablePath,
+                lakeSnapshot.getSnapshotId(),
+                Arrays.toString(primaryKeyIndexes),
+                Arrays.toString(lookupKey.primaryKeyValues));
         List<LakeSplit> splits = planner.plan();
+        LOG.info(
+                "Refreshing lake lookup for table {}, snapshot {}, split count {}.",
+                tablePath,
+                lakeSnapshot.getSnapshotId(),
+                splits.size());
+        lakeLookup.refresh(splits);
         for (LakeSplit split : splits) {
-            RecordReader reader =
-                    lakeSource.createRecordReader(
-                            (LakeSource.ReaderContext<LakeSplit>) () -> split);
-            try (CloseableIterator<LogRecord> iterator = reader.read()) {
-                while (iterator.hasNext()) {
-                    RowData row =
-                            flussRowToFlinkRowConverter.toFlinkRowData(
-                                    maybeProject(iterator.next().getRow()));
-                    if (remainingFilter == null || remainingFilter.isMatch(row)) {
-                        return Collections.singletonList(row);
-                    }
-                }
+            if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
+                continue;
+            }
+            LOG.info(
+                    "Calling lake lookup for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
+                    tablePath,
+                    lakeSnapshot.getSnapshotId(),
+                    split.partition(),
+                    split.bucket(),
+                    Arrays.toString(primaryKeyIndexes),
+                    Arrays.toString(lookupKey.primaryKeyValues));
+            InternalRow row =
+                    lakeLookup.lookup(
+                            split.partition(),
+                            split.bucket(),
+                            lookupKey.primaryKeyValues,
+                            primaryKeyIndexes);
+            if (row == null) {
+                continue;
+            }
+            RowData flinkRow = flussRowToFlinkRowConverter.toFlinkRowData(row);
+            if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
+                return Collections.singletonList(flinkRow);
             }
         }
         return Collections.emptyList();
+    }
+
+    private boolean matchesLookupPartition(LakeSplit split, String partitionValue) {
+        return split.partition().isEmpty() || split.partition().contains(partitionValue);
+    }
+
+    @SuppressWarnings("unchecked")
+    private LakeLookup<LakeSplit> createLakeLookup() {
+        LakeSource<LakeSplit> lakeSource =
+                checkNotNull(
+                        createLakeSource(tablePath, tableOptions),
+                        "Lake source must not be null for lake fallback lookup.");
+        if (projection != null) {
+            lakeSource.withProject(toNestedProjection(projection));
+        }
+        if (!(lakeSource instanceof SupportsLakeLookup)) {
+            throw new TableException(
+                    "Lake fallback lookup requires the lake source to support primary-key lookup.");
+        }
+        try {
+            return ((SupportsLakeLookup<LakeSplit>) lakeSource).createLookup();
+        } catch (Exception e) {
+            throw new TableException("Failed to create lake fallback lookup.", e);
+        }
     }
 
     private Predicate createPrimaryKeyPredicate(Object[] primaryKeyValues) {
@@ -590,6 +634,9 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         }
         if (table != null) {
             table.close();
+        }
+        if (lakeLookup != null) {
+            lakeLookup.close();
         }
         if (connection != null) {
             connection.close();

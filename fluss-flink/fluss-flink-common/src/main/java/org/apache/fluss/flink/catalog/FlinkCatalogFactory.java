@@ -37,7 +37,7 @@ import static org.apache.fluss.utils.PropertiesUtils.extractPrefix;
 /** Factory for {@link FlinkCatalog}. */
 public class FlinkCatalogFactory implements CatalogFactory {
 
-    public static final String IDENTIFIER = "fluss";
+    public static final String IDENTIFIER = "fluss-test";
 
     public static final List<String> PREFIXES_TO_SKIP_VALIDATE = new ArrayList<>();
 

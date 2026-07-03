@@ -33,11 +33,20 @@ import static org.apache.fluss.lake.paimon.PaimonLakeCatalog.SYSTEM_COLUMNS;
 public class PaimonRowAsFlussRow implements InternalRow {
 
     private org.apache.paimon.data.InternalRow paimonRow;
+    private final boolean containsSystemColumns;
 
-    public PaimonRowAsFlussRow() {}
+    public PaimonRowAsFlussRow() {
+        this.containsSystemColumns = true;
+    }
 
     public PaimonRowAsFlussRow(org.apache.paimon.data.InternalRow paimonRow) {
+        this(paimonRow, true);
+    }
+
+    public PaimonRowAsFlussRow(
+            org.apache.paimon.data.InternalRow paimonRow, boolean containsSystemColumns) {
         this.paimonRow = paimonRow;
+        this.containsSystemColumns = containsSystemColumns;
     }
 
     public PaimonRowAsFlussRow replaceRow(org.apache.paimon.data.InternalRow paimonRow) {
@@ -47,7 +56,9 @@ public class PaimonRowAsFlussRow implements InternalRow {
 
     @Override
     public int getFieldCount() {
-        return paimonRow.getFieldCount() - SYSTEM_COLUMNS.size();
+        return containsSystemColumns
+                ? paimonRow.getFieldCount() - SYSTEM_COLUMNS.size()
+                : paimonRow.getFieldCount();
     }
 
     @Override

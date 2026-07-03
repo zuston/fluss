@@ -18,8 +18,10 @@
 
 package org.apache.fluss.lake.paimon.source;
 
+import org.apache.fluss.lake.source.LakeLookup;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.RecordReader;
+import org.apache.fluss.lake.source.SupportsLakeLookup;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.FieldRef;
 import org.apache.fluss.predicate.FunctionVisitor;
@@ -192,5 +194,86 @@ class PaimonLakeSourceTest extends PaimonSourceTestBase {
             throw new UnsupportedOperationException(
                     "Unsupported filter function for test purpose.");
         }
+    }
+
+    @Test
+    void testLookup() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "test_lookup");
+        createTable(tablePath, SCHEMA);
+        writeRows(tablePath);
+
+        LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
+        List<PaimonSplit> paimonSplits = lakeSource.createPlanner(() -> 1).plan();
+
+        try (LakeLookup<PaimonSplit> lookup =
+                ((SupportsLakeLookup<PaimonSplit>) lakeSource).createLookup()) {
+            lookup.refresh(paimonSplits);
+            PaimonSplit paimonSplit = paimonSplits.get(0);
+            org.apache.fluss.row.InternalRow row =
+                    lookup.lookup(
+                            paimonSplit.partition(),
+                            paimonSplit.bucket(),
+                            new Object[] {2},
+                            new int[] {0});
+
+            org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters =
+                    org.apache.fluss.row.InternalRow.createFieldGetters(
+                            RowType.of(new IntType(), new StringType()));
+            assertThat(
+                            convertToFlinkRow(
+                                            fieldGetters,
+                                            CloseableIterator.wrap(
+                                                    Collections.singleton(row).iterator()))
+                                    .toString())
+                    .isEqualTo("[+I[2, name2]]");
+        }
+    }
+
+    @Test
+    void testLookupWithProject() throws Exception {
+        TablePath tablePath = TablePath.of("fluss", "test_lookup_with_project");
+        createTable(tablePath, SCHEMA);
+        writeRows(tablePath);
+
+        LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
+        lakeSource.withProject(new int[][] {new int[] {1}});
+        List<PaimonSplit> paimonSplits = lakeSource.createPlanner(() -> 1).plan();
+
+        try (LakeLookup<PaimonSplit> lookup =
+                ((SupportsLakeLookup<PaimonSplit>) lakeSource).createLookup()) {
+            lookup.refresh(paimonSplits);
+            PaimonSplit paimonSplit = paimonSplits.get(0);
+            org.apache.fluss.row.InternalRow row =
+                    lookup.lookup(
+                            paimonSplit.partition(),
+                            paimonSplit.bucket(),
+                            new Object[] {3},
+                            new int[] {0});
+
+            org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters =
+                    org.apache.fluss.row.InternalRow.createFieldGetters(
+                            RowType.of(new StringType()));
+            assertThat(
+                            convertToFlinkRow(
+                                            fieldGetters,
+                                            CloseableIterator.wrap(
+                                                    Collections.singleton(row).iterator()))
+                                    .toString())
+                    .isEqualTo("[+I[name3]]");
+        }
+    }
+
+    private void writeRows(TablePath tablePath) throws Exception {
+        List<InternalRow> rows = new ArrayList<>();
+        for (int i = 1; i <= 4; i++) {
+            rows.add(
+                    GenericRow.of(
+                            i,
+                            BinaryString.fromString("name" + i),
+                            0,
+                            (long) i,
+                            Timestamp.fromEpochMillis(System.currentTimeMillis())));
+        }
+        writeRecord(tablePath, rows);
     }
 }
