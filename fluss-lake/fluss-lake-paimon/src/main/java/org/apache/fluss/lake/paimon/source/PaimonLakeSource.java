@@ -41,10 +41,16 @@ import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentMap;
 
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
+import static org.apache.fluss.utils.MapUtils.newConcurrentHashMap;
 
 /**
  * Paimon Lake format implementation of {@link org.apache.fluss.lake.source.LakeSource} for reading
@@ -52,8 +58,11 @@ import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
  */
 public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLookup<PaimonSplit> {
     private static final long serialVersionUID = 1L;
+    private static final ConcurrentMap<TableCacheKey, FileStoreTable> TABLE_CACHE =
+            newConcurrentHashMap();
 
     private final Configuration paimonConfig;
+    private final TableCacheKey tableCacheKey;
     private final TablePath tablePath;
 
     private @Nullable int[][] project;
@@ -61,6 +70,7 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
 
     public PaimonLakeSource(Configuration paimonConfig, TablePath tablePath) {
         this.paimonConfig = paimonConfig;
+        this.tableCacheKey = new TableCacheKey(paimonConfig.toMap(), tablePath);
         this.tablePath = tablePath;
     }
 
@@ -79,7 +89,7 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
         List<Predicate> unConsumedPredicates = new ArrayList<>();
         List<Predicate> consumedPredicates = new ArrayList<>();
         List<org.apache.paimon.predicate.Predicate> converted = new ArrayList<>();
-        RowType rowType = getRowType(tablePath);
+        RowType rowType = getRowType();
         for (Predicate predicate : predicates) {
             Optional<org.apache.paimon.predicate.Predicate> optPredicate =
                     FlussToPaimonPredicateConverter.convert(rowType, predicate);
@@ -98,14 +108,13 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
 
     @Override
     public Planner<PaimonSplit> createPlanner(PlannerContext plannerContext) {
-        return new PaimonSplitPlanner(
-                paimonConfig, tablePath, predicate, plannerContext.snapshotId());
+        return new PaimonSplitPlanner(getTable(), predicate, plannerContext.snapshotId());
     }
 
     @Override
     public RecordReader createRecordReader(ReaderContext<PaimonSplit> context) throws IOException {
-        try (Catalog catalog = getCatalog()) {
-            FileStoreTable fileStoreTable = getTable(catalog, tablePath);
+        try {
+            FileStoreTable fileStoreTable = getTable();
             if (fileStoreTable.primaryKeys().isEmpty()) {
                 return new PaimonRecordReader(
                         fileStoreTable, context.lakeSplit(), project, predicate);
@@ -120,8 +129,13 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
 
     @Override
     public LakeLookup<PaimonSplit> createLookup() throws IOException {
-        try (Catalog catalog = getCatalog()) {
-            return new PaimonLakeLookup(getTable(catalog, tablePath), project);
+        return createLookup(null);
+    }
+
+    @Override
+    public LakeLookup<PaimonSplit> createLookup(@Nullable String ioTmpDir) throws IOException {
+        try {
+            return new PaimonLakeLookup(getTable(), project, ioTmpDir);
         } catch (Exception e) {
             throw new IOException("Fail to create lookup.", e);
         }
@@ -137,16 +151,51 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
                 CatalogContext.create(Options.fromMap(paimonConfig.toMap())));
     }
 
-    private FileStoreTable getTable(Catalog catalog, TablePath tablePath) throws Exception {
+    private FileStoreTable getTable() {
+        return TABLE_CACHE.computeIfAbsent(tableCacheKey, ignored -> loadTable());
+    }
+
+    private FileStoreTable loadTable() {
+        try (Catalog catalog = getCatalog()) {
+            return getTable(catalog, tablePath);
+        } catch (Exception e) {
+            throw new RuntimeException("Fail to get table " + tablePath, e);
+        }
+    }
+
+    private static FileStoreTable getTable(Catalog catalog, TablePath tablePath) throws Exception {
         return (FileStoreTable) catalog.getTable(toPaimon(tablePath));
     }
 
-    private RowType getRowType(TablePath tablePath) {
-        try (Catalog catalog = getCatalog()) {
-            FileStoreTable fileStoreTable = getTable(catalog, tablePath);
-            return fileStoreTable.rowType();
-        } catch (Exception e) {
-            throw new RuntimeException("Fail to get row type of " + tablePath, e);
+    private RowType getRowType() {
+        return getTable().rowType();
+    }
+
+    private static class TableCacheKey {
+        private final Map<String, String> paimonConfig;
+        private final TablePath tablePath;
+
+        private TableCacheKey(Map<String, String> paimonConfig, TablePath tablePath) {
+            this.paimonConfig = Collections.unmodifiableMap(new HashMap<>(paimonConfig));
+            this.tablePath = tablePath;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (!(o instanceof TableCacheKey)) {
+                return false;
+            }
+            TableCacheKey that = (TableCacheKey) o;
+            return Objects.equals(paimonConfig, that.paimonConfig)
+                    && Objects.equals(tablePath, that.tablePath);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(paimonConfig, tablePath);
         }
     }
 }

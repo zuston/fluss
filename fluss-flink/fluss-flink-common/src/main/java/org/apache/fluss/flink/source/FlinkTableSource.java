@@ -136,6 +136,7 @@ public class FlinkTableSource
     private final Duration lakeFallbackTimeout;
     private final int lakeFallbackExecutorThreads;
     private final int lakeFallbackMaxConcurrency;
+    @Nullable private final String lakeLookupIoTmpDir;
     @Nullable private final LookupCache cache;
 
     private final long scanPartitionDiscoveryIntervalMs;
@@ -201,6 +202,7 @@ public class FlinkTableSource
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_TIMEOUT.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_EXECUTOR_THREADS.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_MAX_CONCURRENCY.defaultValue(),
+                null,
                 cache,
                 scanPartitionDiscoveryIntervalMs,
                 isDataLakeEnabled,
@@ -226,6 +228,7 @@ public class FlinkTableSource
             Duration lakeFallbackTimeout,
             int lakeFallbackExecutorThreads,
             int lakeFallbackMaxConcurrency,
+            @Nullable String lakeLookupIoTmpDir,
             @Nullable LookupCache cache,
             long scanPartitionDiscoveryIntervalMs,
             boolean isDataLakeEnabled,
@@ -249,6 +252,7 @@ public class FlinkTableSource
                 lakeFallbackTimeout,
                 lakeFallbackExecutorThreads,
                 lakeFallbackMaxConcurrency,
+                lakeLookupIoTmpDir,
                 cache,
                 scanPartitionDiscoveryIntervalMs,
                 FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
@@ -293,6 +297,7 @@ public class FlinkTableSource
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_TIMEOUT.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_EXECUTOR_THREADS.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_MAX_CONCURRENCY.defaultValue(),
+                null,
                 cache,
                 scanPartitionDiscoveryIntervalMs,
                 splitPerAssignmentBatchSize,
@@ -319,6 +324,7 @@ public class FlinkTableSource
             Duration lakeFallbackTimeout,
             int lakeFallbackExecutorThreads,
             int lakeFallbackMaxConcurrency,
+            @Nullable String lakeLookupIoTmpDir,
             @Nullable LookupCache cache,
             long scanPartitionDiscoveryIntervalMs,
             int splitPerAssignmentBatchSize,
@@ -344,6 +350,7 @@ public class FlinkTableSource
         this.lakeFallbackTimeout = lakeFallbackTimeout;
         this.lakeFallbackExecutorThreads = lakeFallbackExecutorThreads;
         this.lakeFallbackMaxConcurrency = lakeFallbackMaxConcurrency;
+        this.lakeLookupIoTmpDir = lakeLookupIoTmpDir;
         this.cache = cache;
 
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
@@ -567,7 +574,8 @@ public class FlinkTableSource
                             lookupTimeZone,
                             lakeFallbackTimeout,
                             lakeFallbackExecutorThreads,
-                            lakeFallbackMaxConcurrency);
+                            lakeFallbackMaxConcurrency,
+                            lakeLookupIoTmpDir);
             return AsyncLookupFunctionProvider.of(asyncLookupFunction);
         }
         if (lookupAsync) {
@@ -668,6 +676,7 @@ public class FlinkTableSource
                         lakeFallbackTimeout,
                         lakeFallbackExecutorThreads,
                         lakeFallbackMaxConcurrency,
+                        lakeLookupIoTmpDir,
                         cache,
                         scanPartitionDiscoveryIntervalMs,
                         splitPerAssignmentBatchSize,

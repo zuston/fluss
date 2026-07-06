@@ -78,6 +78,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -110,6 +111,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private final Duration lakeFallbackTimeout;
     private final int lakeFallbackExecutorThreads;
     private final int lakeFallbackMaxConcurrency;
+    @Nullable private final String lakeLookupIoTmpDir;
 
     private transient FlussRowToFlinkRowConverter flussRowToFlinkRowConverter;
     private transient Connection connection;
@@ -121,9 +123,11 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private transient int autoPartitionKeyPositionInPrimaryKey;
     private transient org.apache.fluss.types.RowType flussFullRowType;
     private transient LakeLookup<LakeSplit> lakeLookup;
+    private transient Object lakeLookupLock;
     private transient ThreadPoolExecutor lakeLookupExecutor;
     private transient ScheduledExecutorService timeoutExecutor;
     private transient AtomicInteger lakeFallbackPendingCount;
+    private transient volatile boolean closed;
     private transient Counter lookupHotFlussHitsTotal;
     private transient Counter lookupHotFlussMissesTotal;
     private transient Counter lookupColdFlussHitsTotal;
@@ -149,7 +153,8 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             ZoneId lookupTimeZone,
             Duration lakeFallbackTimeout,
             int lakeFallbackExecutorThreads,
-            int lakeFallbackMaxConcurrency) {
+            int lakeFallbackMaxConcurrency,
+            @Nullable String lakeLookupIoTmpDir) {
         this.flussConfig = flussConfig;
         this.tablePath = tablePath;
         this.flinkRowType = flinkRowType;
@@ -166,11 +171,13 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         this.lakeFallbackTimeout = lakeFallbackTimeout;
         this.lakeFallbackExecutorThreads = lakeFallbackExecutorThreads;
         this.lakeFallbackMaxConcurrency = lakeFallbackMaxConcurrency;
+        this.lakeLookupIoTmpDir = lakeLookupIoTmpDir;
     }
 
     @Override
     public void open(FunctionContext context) {
         LOG.info("Start opening hybrid lake async lookup function for table {}.", tablePath);
+        closed = false;
         flussFullRowType = FlinkConversions.toFlussRowType(flinkRowType);
         validateLookupShape();
         connection = ConnectionFactory.createConnection(flussConfig);
@@ -188,6 +195,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         flussRowToFlinkRowConverter =
                 new FlussRowToFlinkRowConverter(FlinkConversions.toFlussRowType(outputRowType));
         lakeLookup = createLakeLookup();
+        lakeLookupLock = new Object();
 
         Lookup lookup = table.newLookup();
         lookuper = lookup.createLookuper();
@@ -227,10 +235,16 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         InternalRow flussKeyRow = lookupRow.replace(normalizedKeyRow);
 
         CompletableFuture<Collection<RowData>> future = new CompletableFuture<>();
+        if (closed) {
+            future.complete(Collections.emptyList());
+            return future;
+        }
         lookuper.lookup(flussKeyRow)
                 .whenComplete(
                         (result, throwable) -> {
-                            if (throwable != null) {
+                            if (closed) {
+                                future.complete(Collections.emptyList());
+                            } else if (throwable != null) {
                                 LOG.error(
                                         "Fluss async lookup failed for table {}.",
                                         tablePath,
@@ -262,6 +276,10 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             FlussLookupKey lookupKey,
             @Nullable LookupNormalizer.RemainingFilter remainingFilter,
             CompletableFuture<Collection<RowData>> future) {
+        if (closed) {
+            future.complete(Collections.emptyList());
+            return;
+        }
         lakeFallbackRequestsTotal.inc();
         lakeFallbackPendingCount.incrementAndGet();
         long startMs = System.currentTimeMillis();
@@ -270,7 +288,10 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             lakeLookupExecutor.execute(
                     () -> {
                         try {
-                            Collection<RowData> rows = lookupLake(lookupKey, remainingFilter);
+                            Collection<RowData> rows =
+                                    closed
+                                            ? Collections.emptyList()
+                                            : lookupLake(lookupKey, remainingFilter);
                             completeLakeFallbackSuccessfully(future, rows, startMs);
                         } catch (Throwable t) {
                             completeLakeFallbackExceptionally(
@@ -337,6 +358,9 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private Collection<RowData> lookupLake(
             FlussLookupKey lookupKey, @Nullable LookupNormalizer.RemainingFilter remainingFilter)
             throws Exception {
+        if (closed) {
+            return Collections.emptyList();
+        }
         LakeSnapshot lakeSnapshot;
         try {
             lakeSnapshot = admin.getReadableLakeSnapshot(tablePath).get();
@@ -367,36 +391,41 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 Arrays.toString(primaryKeyIndexes),
                 Arrays.toString(lookupKey.primaryKeyValues));
         List<LakeSplit> splits = planner.plan();
-        LOG.info(
-                "Refreshing lake lookup for table {}, snapshot {}, split count {}.",
-                tablePath,
-                lakeSnapshot.getSnapshotId(),
-                splits.size());
-        lakeLookup.refresh(splits);
-        for (LakeSplit split : splits) {
-            if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
-                continue;
+        synchronized (lakeLookupLock) {
+            if (closed) {
+                return Collections.emptyList();
             }
             LOG.info(
-                    "Calling lake lookup for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
+                    "Refreshing lake lookup for table {}, snapshot {}, split count {}.",
                     tablePath,
                     lakeSnapshot.getSnapshotId(),
-                    split.partition(),
-                    split.bucket(),
-                    Arrays.toString(primaryKeyIndexes),
-                    Arrays.toString(lookupKey.primaryKeyValues));
-            InternalRow row =
-                    lakeLookup.lookup(
-                            split.partition(),
-                            split.bucket(),
-                            lookupKey.primaryKeyValues,
-                            primaryKeyIndexes);
-            if (row == null) {
-                continue;
-            }
-            RowData flinkRow = flussRowToFlinkRowConverter.toFlinkRowData(row);
-            if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
-                return Collections.singletonList(flinkRow);
+                    splits.size());
+            lakeLookup.refresh(splits);
+            for (LakeSplit split : splits) {
+                if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
+                    continue;
+                }
+                LOG.info(
+                        "Calling lake lookup for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
+                        tablePath,
+                        lakeSnapshot.getSnapshotId(),
+                        split.partition(),
+                        split.bucket(),
+                        Arrays.toString(primaryKeyIndexes),
+                        Arrays.toString(lookupKey.primaryKeyValues));
+                InternalRow row =
+                        lakeLookup.lookup(
+                                split.partition(),
+                                split.bucket(),
+                                lookupKey.primaryKeyValues,
+                                primaryKeyIndexes);
+                if (row == null) {
+                    continue;
+                }
+                RowData flinkRow = flussRowToFlinkRowConverter.toFlinkRowData(row);
+                if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
+                    return Collections.singletonList(flinkRow);
+                }
             }
         }
         return Collections.emptyList();
@@ -420,7 +449,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     "Lake fallback lookup requires the lake source to support primary-key lookup.");
         }
         try {
-            return ((SupportsLakeLookup<LakeSplit>) lakeSource).createLookup();
+            return ((SupportsLakeLookup<LakeSplit>) lakeSource).createLookup(lakeLookupIoTmpDir);
         } catch (Exception e) {
             throw new TableException("Failed to create lake fallback lookup.", e);
         }
@@ -626,20 +655,71 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     @Override
     public void close() throws Exception {
         LOG.info("Closing hybrid lake async lookup function for table {}.", tablePath);
+        closed = true;
         if (lakeLookupExecutor != null) {
-            lakeLookupExecutor.shutdownNow();
+            shutdownExecutor("lake fallback lookup", lakeLookupExecutor);
         }
         if (timeoutExecutor != null) {
-            timeoutExecutor.shutdownNow();
+            shutdownExecutor("lake fallback timeout", timeoutExecutor);
         }
+        Exception exception = null;
         if (table != null) {
-            table.close();
+            try {
+                table.close();
+            } catch (Exception e) {
+                exception = e;
+            }
         }
         if (lakeLookup != null) {
-            lakeLookup.close();
+            try {
+                if (lakeLookupLock == null) {
+                    lakeLookup.close();
+                } else {
+                    synchronized (lakeLookupLock) {
+                        lakeLookup.close();
+                    }
+                }
+            } catch (Exception e) {
+                if (exception == null) {
+                    exception = e;
+                } else {
+                    exception.addSuppressed(e);
+                }
+            }
         }
         if (connection != null) {
-            connection.close();
+            try {
+                connection.close();
+            } catch (Exception e) {
+                if (exception == null) {
+                    exception = e;
+                } else {
+                    exception.addSuppressed(e);
+                }
+            }
+        }
+        if (exception != null) {
+            throw exception;
+        }
+    }
+
+    private void shutdownExecutor(String executorName, ExecutorService executor) {
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(lakeFallbackTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
+                LOG.warn(
+                        "Timed out waiting {} for {} executor to terminate for table {}.",
+                        lakeFallbackTimeout,
+                        executorName,
+                        tablePath);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.warn(
+                    "Interrupted while waiting for {} executor to terminate for table {}.",
+                    executorName,
+                    tablePath,
+                    e);
         }
     }
 

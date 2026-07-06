@@ -64,11 +64,18 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
             new HashMap<>();
 
     public PaimonLakeLookup(FileStoreTable fileStoreTable, @Nullable int[][] project) {
+        this(fileStoreTable, project, null);
+    }
+
+    public PaimonLakeLookup(
+            FileStoreTable fileStoreTable,
+            @Nullable int[][] project,
+            @Nullable String ioManagerTmpDir) {
         if (fileStoreTable.primaryKeys().isEmpty()) {
             throw new UnsupportedOperationException(
                     "Paimon lake lookup only supports primary-key tables.");
         }
-        this.ioManager = createIOManager();
+        this.ioManager = createIOManager(ioManagerTmpDir);
         this.paimonRowType = fileStoreTable.rowType();
         this.partitionSerializer =
                 new InternalRowSerializer(fileStoreTable.schema().logicalPartitionType());
@@ -83,8 +90,19 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
 
     @Override
     public synchronized void refresh(List<PaimonSplit> splits) {
+        Map<PaimonPartitionBucket, Map<String, DataFileMeta>> plannedFiles = new HashMap<>();
         for (PaimonSplit split : splits) {
-            refreshSplit(split);
+            Map<String, DataFileMeta> files =
+                    plannedFiles.computeIfAbsent(
+                            createPartitionBucket(split), ignored -> new HashMap<>());
+            for (DataFileMeta file : split.dataSplit().dataFiles()) {
+                files.put(file.fileName(), file);
+            }
+        }
+
+        for (Map.Entry<PaimonPartitionBucket, Map<String, DataFileMeta>> entry :
+                plannedFiles.entrySet()) {
+            refreshFiles(entry.getKey(), entry.getValue());
         }
     }
 
@@ -105,7 +123,14 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
                 bucket,
                 Arrays.toString(primaryKeyIndexes),
                 Arrays.toString(primaryKeyValues));
+        long startMs = System.currentTimeMillis();
         org.apache.paimon.data.InternalRow row = tableQuery.lookup(partition, bucket, key);
+        LOG.info(
+                "Finished Paimon LocalTableQuery lookup for partition {}, bucket {}, hit {}, duration {} ms.",
+                partitionValues,
+                bucket,
+                row != null,
+                System.currentTimeMillis() - startMs);
         if (row != null) {
             return new PaimonRowAsFlussRow(row, !projected);
         }
@@ -134,49 +159,65 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
         return lookupRow;
     }
 
-    private void refreshSplit(PaimonSplit split) {
-        PaimonPartitionBucket partitionBucket =
-                new PaimonPartitionBucket(
-                        split.dataSplit().partition(), split.dataSplit().bucket());
+    private PaimonPartitionBucket createPartitionBucket(PaimonSplit split) {
+        return new PaimonPartitionBucket(split.dataSplit().partition(), split.dataSplit().bucket());
+    }
+
+    private void refreshFiles(
+            PaimonPartitionBucket partitionBucket, Map<String, DataFileMeta> plannedFiles) {
         Map<String, DataFileMeta> knownFiles =
                 loadedFiles.computeIfAbsent(partitionBucket, ignored -> new HashMap<>());
 
         List<DataFileMeta> beforeFiles =
-                split.dataSplit().beforeFiles().stream()
-                        .filter(file -> knownFiles.remove(file.fileName()) != null)
+                knownFiles.entrySet().stream()
+                        .filter(entry -> !plannedFiles.containsKey(entry.getKey()))
+                        .map(Map.Entry::getValue)
                         .collect(Collectors.toList());
         List<DataFileMeta> afterFiles = new ArrayList<>();
-        for (DataFileMeta file : split.dataSplit().dataFiles()) {
-            if (!knownFiles.containsKey(file.fileName())) {
-                knownFiles.put(file.fileName(), file);
-                afterFiles.add(file);
+        for (Map.Entry<String, DataFileMeta> entry : plannedFiles.entrySet()) {
+            if (!knownFiles.containsKey(entry.getKey())) {
+                afterFiles.add(entry.getValue());
             }
+        }
+        for (DataFileMeta file : beforeFiles) {
+            knownFiles.remove(file.fileName());
+        }
+        for (DataFileMeta file : afterFiles) {
+            knownFiles.put(file.fileName(), file);
         }
         if (!beforeFiles.isEmpty() || !afterFiles.isEmpty()) {
             LOG.info(
                     "Calling Paimon LocalTableQuery refreshFiles for partition {}, bucket {}, before file count {}, after file count {}.",
-                    split.partition(),
-                    split.bucket(),
+                    partitionBucket.getPartition(),
+                    partitionBucket.getBucket(),
                     beforeFiles.size(),
                     afterFiles.size());
+            long startMs = System.currentTimeMillis();
             tableQuery.refreshFiles(
-                    split.dataSplit().partition(),
-                    split.dataSplit().bucket(),
+                    partitionBucket.getPartition(),
+                    partitionBucket.getBucket(),
                     beforeFiles,
                     afterFiles);
+            LOG.info(
+                    "Finished Paimon LocalTableQuery refreshFiles for partition {}, bucket {}, before file count {}, after file count {}, duration {} ms.",
+                    partitionBucket.getPartition(),
+                    partitionBucket.getBucket(),
+                    beforeFiles.size(),
+                    afterFiles.size(),
+                    System.currentTimeMillis() - startMs);
         }
     }
 
-    private static IOManager createIOManager() {
-        File tempDir =
-                new File(
-                        System.getProperty("java.io.tmpdir"),
-                        "fluss-paimon-lookup-" + UUID.randomUUID());
+    private static IOManager createIOManager(@Nullable String ioManagerTmpDir) {
+        String rootDir =
+                ioManagerTmpDir == null ? System.getProperty("java.io.tmpdir") : ioManagerTmpDir;
+        File tempDir = new File(rootDir, "fluss-paimon-lookup-" + UUID.randomUUID());
+        LOG.info("Creating Paimon lookup IO manager under {}.", tempDir.getAbsolutePath());
         return IOManager.create(tempDir.getAbsolutePath());
     }
 
     @Override
-    public void close() throws IOException {
+    public synchronized void close() throws IOException {
         IOException exception = null;
         try {
             tableQuery.close();

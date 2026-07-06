@@ -19,6 +19,8 @@ package org.apache.fluss.lake.source;
 
 import org.apache.fluss.annotation.PublicEvolving;
 
+import javax.annotation.Nullable;
+
 import java.io.IOException;
 
 /** Optional capability for lake sources that support primary-key point lookup. */
@@ -27,4 +29,12 @@ public interface SupportsLakeLookup<Split extends LakeSplit> {
 
     /** Creates a reusable lookup object using the current projection of the lake source. */
     LakeLookup<Split> createLookup() throws IOException;
+
+    /**
+     * Creates a reusable lookup object using the current projection of the lake source and the
+     * runtime IO temporary directory when the implementation needs one.
+     */
+    default LakeLookup<Split> createLookup(@Nullable String ioTmpDir) throws IOException {
+        return createLookup();
+    }
 }
