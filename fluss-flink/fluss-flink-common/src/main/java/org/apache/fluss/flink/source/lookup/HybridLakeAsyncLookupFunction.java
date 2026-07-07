@@ -125,8 +125,8 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private transient InternalRow.FieldGetter[] primaryKeyFieldGetters;
     private transient int autoPartitionKeyPositionInPrimaryKey;
     private transient org.apache.fluss.types.RowType flussFullRowType;
-    private transient LakeLookup<LakeSplit> lakeLookup;
-    private transient Object lakeLookupLock;
+    private transient List<LakeLookupHandle> lakeLookupHandles;
+    private transient ThreadLocal<LakeLookupHandle> lakeLookupThreadLocal;
     private transient ThreadPoolExecutor lakeLookupExecutor;
     private transient ScheduledExecutorService timeoutExecutor;
     private transient ScheduledExecutorService windowStatsExecutor;
@@ -199,8 +199,8 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         }
         flussRowToFlinkRowConverter =
                 new FlussRowToFlinkRowConverter(FlinkConversions.toFlussRowType(outputRowType));
-        lakeLookup = createLakeLookup();
-        lakeLookupLock = new Object();
+        lakeLookupHandles = Collections.synchronizedList(new ArrayList<>());
+        lakeLookupThreadLocal = ThreadLocal.withInitial(this::createLakeLookupHandle);
 
         Lookup lookup = table.newLookup();
         lookuper = lookup.createLookuper();
@@ -433,28 +433,29 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     "Lake fallback lookup requires primary-key predicates to be pushed down.");
         }
         Planner<LakeSplit> planner = lakeSource.createPlanner(lakeSnapshot::getSnapshotId);
-        LOG.info(
+        LOG.debug(
                 "Planning lake lookup splits for table {}, snapshot {}, primary key indexes {}, primary key values {}.",
                 tablePath,
                 lakeSnapshot.getSnapshotId(),
                 Arrays.toString(primaryKeyIndexes),
                 Arrays.toString(lookupKey.primaryKeyValues));
         List<LakeSplit> splits = planner.plan();
-        synchronized (lakeLookupLock) {
+        LakeLookupHandle lakeLookupHandle = lakeLookupThreadLocal.get();
+        synchronized (lakeLookupHandle.lock) {
             if (closed) {
                 return Collections.emptyList();
             }
-            LOG.info(
+            LOG.debug(
                     "Refreshing lake lookup for table {}, snapshot {}, split count {}.",
                     tablePath,
                     lakeSnapshot.getSnapshotId(),
                     splits.size());
-            lakeLookup.refresh(splits);
+            lakeLookupHandle.lookup.refresh(splits);
             for (LakeSplit split : splits) {
                 if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
                     continue;
                 }
-                LOG.info(
+                LOG.debug(
                         "Calling lake lookup for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
                         tablePath,
                         lakeSnapshot.getSnapshotId(),
@@ -463,7 +464,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                         Arrays.toString(primaryKeyIndexes),
                         Arrays.toString(lookupKey.primaryKeyValues));
                 InternalRow row =
-                        lakeLookup.lookup(
+                        lakeLookupHandle.lookup.lookup(
                                 split.partition(),
                                 split.bucket(),
                                 lookupKey.primaryKeyValues,
@@ -482,6 +483,21 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
 
     private boolean matchesLookupPartition(LakeSplit split, String partitionValue) {
         return split.partition().isEmpty() || split.partition().contains(partitionValue);
+    }
+
+    private LakeLookupHandle createLakeLookupHandle() {
+        LakeLookupHandle lakeLookupHandle = new LakeLookupHandle(createLakeLookup());
+        int lookupIndex;
+        synchronized (lakeLookupHandles) {
+            lakeLookupHandles.add(lakeLookupHandle);
+            lookupIndex = lakeLookupHandles.size();
+        }
+        LOG.info(
+                "Created lake fallback lookup instance {}/{} for table {}.",
+                lookupIndex,
+                lakeFallbackExecutorThreads,
+                tablePath);
+        return lakeLookupHandle;
     }
 
     @SuppressWarnings("unchecked")
@@ -757,20 +773,22 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 exception = e;
             }
         }
-        if (lakeLookup != null) {
-            try {
-                if (lakeLookupLock == null) {
-                    lakeLookup.close();
-                } else {
-                    synchronized (lakeLookupLock) {
-                        lakeLookup.close();
+        if (lakeLookupHandles != null) {
+            List<LakeLookupHandle> handles;
+            synchronized (lakeLookupHandles) {
+                handles = new ArrayList<>(lakeLookupHandles);
+            }
+            for (LakeLookupHandle handle : handles) {
+                try {
+                    synchronized (handle.lock) {
+                        handle.lookup.close();
                     }
-                }
-            } catch (Exception e) {
-                if (exception == null) {
-                    exception = e;
-                } else {
-                    exception.addSuppressed(e);
+                } catch (Exception e) {
+                    if (exception == null) {
+                        exception = e;
+                    } else {
+                        exception.addSuppressed(e);
+                    }
                 }
             }
         }
@@ -807,6 +825,15 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     executorName,
                     tablePath,
                     e);
+        }
+    }
+
+    private static class LakeLookupHandle {
+        private final LakeLookup<LakeSplit> lookup;
+        private final Object lock = new Object();
+
+        private LakeLookupHandle(LakeLookup<LakeSplit> lookup) {
+            this.lookup = lookup;
         }
     }
 

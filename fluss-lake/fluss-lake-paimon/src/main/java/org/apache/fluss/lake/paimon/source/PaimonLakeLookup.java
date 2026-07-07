@@ -117,7 +117,7 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
         rowKeyExtractor.setRecord(lookupRow);
         BinaryRow key = rowKeyExtractor.trimmedPrimaryKey();
         BinaryRow partition = createPartition(partitionValues);
-        LOG.info(
+        LOG.debug(
                 "Calling Paimon LocalTableQuery lookup for partition {}, bucket {}, primary key indexes {}, primary key values {}.",
                 partitionValues,
                 bucket,
@@ -125,7 +125,7 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
                 Arrays.toString(primaryKeyValues));
         long startMs = System.currentTimeMillis();
         org.apache.paimon.data.InternalRow row = tableQuery.lookup(partition, bucket, key);
-        LOG.info(
+        LOG.debug(
                 "Finished Paimon LocalTableQuery lookup for partition {}, bucket {}, hit {}, duration {} ms.",
                 partitionValues,
                 bucket,
