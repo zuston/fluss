@@ -302,7 +302,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         periodicLookupStats.recordLakeRequest();
         lakeFallbackPendingCount.incrementAndGet();
         long startMs = System.currentTimeMillis();
-        scheduleTimeout(future, startMs);
+        scheduleTimeout(future, lookupKey, startMs);
         try {
             lakeLookupExecutor.execute(
                     () -> {
@@ -334,16 +334,16 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         }
     }
 
-    private void scheduleTimeout(CompletableFuture<Collection<RowData>> future, long startMs) {
+    private void scheduleTimeout(
+            CompletableFuture<Collection<RowData>> future, FlussLookupKey lookupKey, long startMs) {
         timeoutExecutor.schedule(
                 () ->
-                        completeLakeFallbackExceptionally(
+                        completeLakeFallbackOnTimeout(
                                 future,
+                                lookupKey,
                                 new TimeoutException(
                                         "Lake fallback lookup timed out after "
                                                 + lakeFallbackTimeout),
-                                lakeFallbackTimeoutsTotal,
-                                LakeFallbackOutcome.TIMEOUT,
                                 startMs),
                 lakeFallbackTimeout.toMillis(),
                 TimeUnit.MILLISECONDS);
@@ -374,6 +374,28 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             failureCounter.inc();
             periodicLookupStats.recordLakeFailure(latencyMs, outcome);
             recordLakeFallbackCompletion(latencyMs);
+        }
+    }
+
+    private void completeLakeFallbackOnTimeout(
+            CompletableFuture<Collection<RowData>> future,
+            FlussLookupKey lookupKey,
+            TimeoutException timeoutException,
+            long startMs) {
+        if (future.complete(Collections.emptyList())) {
+            long latencyMs = elapsedMillis(startMs);
+            lakeFallbackTimeoutsTotal.inc();
+            periodicLookupStats.recordLakeFailure(latencyMs, LakeFallbackOutcome.TIMEOUT);
+            recordLakeFallbackCompletion(latencyMs);
+            LOG.warn(
+                    "Lake fallback lookup timed out for table {}, partition {}, primary key indexes {}, primary key values {}, timeout {}, latencyMs {}. Completing with empty result to avoid failing the lookup.",
+                    tablePath,
+                    lookupKey.partitionValue,
+                    Arrays.toString(primaryKeyIndexes),
+                    Arrays.toString(lookupKey.primaryKeyValues),
+                    lakeFallbackTimeout,
+                    latencyMs,
+                    timeoutException);
         }
     }
 
