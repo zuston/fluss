@@ -75,6 +75,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -95,6 +96,8 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
 
     private static final Logger LOG = LoggerFactory.getLogger(HybridLakeAsyncLookupFunction.class);
     private static final long serialVersionUID = 1L;
+    private static final long LOOKUP_WINDOW_STATS_INTERVAL_MS = TimeUnit.MINUTES.toMillis(5);
+    private static final int LOOKUP_WINDOW_LATENCY_SAMPLE_SIZE = 8192;
 
     private final Configuration flussConfig;
     private final TablePath tablePath;
@@ -126,7 +129,9 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private transient Object lakeLookupLock;
     private transient ThreadPoolExecutor lakeLookupExecutor;
     private transient ScheduledExecutorService timeoutExecutor;
+    private transient ScheduledExecutorService windowStatsExecutor;
     private transient AtomicInteger lakeFallbackPendingCount;
+    private transient PeriodicLookupStats periodicLookupStats;
     private transient volatile boolean closed;
     private transient Counter lookupHotFlussHitsTotal;
     private transient Counter lookupHotFlussMissesTotal;
@@ -222,7 +227,12 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 new ScheduledThreadPoolExecutor(
                         1, new ExecutorThreadFactory("fluss-lake-fallback-timeout"));
         lakeFallbackPendingCount = new AtomicInteger();
+        periodicLookupStats = new PeriodicLookupStats();
         registerMetrics(context);
+        windowStatsExecutor =
+                new ScheduledThreadPoolExecutor(
+                        1, new ExecutorThreadFactory("fluss-hybrid-lookup-window-stats"));
+        startPeriodicStatsReporting();
         LOG.info("Finished opening hybrid lake async lookup function for table {}.", tablePath);
     }
 
@@ -239,12 +249,15 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             future.complete(Collections.emptyList());
             return future;
         }
+        long flussLookupStartMs = System.currentTimeMillis();
         lookuper.lookup(flussKeyRow)
                 .whenComplete(
                         (result, throwable) -> {
                             if (closed) {
                                 future.complete(Collections.emptyList());
                             } else if (throwable != null) {
+                                periodicLookupStats.recordFlussFailure(
+                                        elapsedMillis(flussLookupStartMs));
                                 LOG.error(
                                         "Fluss async lookup failed for table {}.",
                                         tablePath,
@@ -254,19 +267,24 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                                                 "Execution of Fluss async lookup failed: "
                                                         + throwable.getMessage(),
                                                 throwable));
-                            } else if (!isColdPartition(lookupKey.partitionValue)) {
-                                if (result.getRowList().isEmpty()) {
-                                    lookupHotFlussMissesTotal.inc();
-                                } else {
-                                    lookupHotFlussHitsTotal.inc();
-                                }
-                                handleLookupSuccess(future, result, remainingFilter);
-                            } else if (!result.getRowList().isEmpty()) {
-                                lookupColdFlussHitsTotal.inc();
-                                handleLookupSuccess(future, result, remainingFilter);
                             } else {
-                                lookupColdFlussMissesTotal.inc();
-                                lookupLakeAsync(lookupKey, remainingFilter, future);
+                                boolean flussHit = !result.getRowList().isEmpty();
+                                periodicLookupStats.recordFlussCompletion(
+                                        elapsedMillis(flussLookupStartMs), flussHit);
+                                if (!isColdPartition(lookupKey.partitionValue)) {
+                                    if (result.getRowList().isEmpty()) {
+                                        lookupHotFlussMissesTotal.inc();
+                                    } else {
+                                        lookupHotFlussHitsTotal.inc();
+                                    }
+                                    handleLookupSuccess(future, result, remainingFilter);
+                                } else if (!result.getRowList().isEmpty()) {
+                                    lookupColdFlussHitsTotal.inc();
+                                    handleLookupSuccess(future, result, remainingFilter);
+                                } else {
+                                    lookupColdFlussMissesTotal.inc();
+                                    lookupLakeAsync(lookupKey, remainingFilter, future);
+                                }
                             }
                         });
         return future;
@@ -281,6 +299,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             return;
         }
         lakeFallbackRequestsTotal.inc();
+        periodicLookupStats.recordLakeRequest();
         lakeFallbackPendingCount.incrementAndGet();
         long startMs = System.currentTimeMillis();
         scheduleTimeout(future, startMs);
@@ -301,6 +320,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                                                     + t.getMessage(),
                                             t),
                                     lakeFallbackFailuresTotal,
+                                    LakeFallbackOutcome.FAILURE,
                                     startMs);
                         }
                     });
@@ -309,6 +329,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     future,
                     new RuntimeException("Lake fallback lookup executor is overloaded.", e),
                     lakeFallbackRejectedTotal,
+                    LakeFallbackOutcome.REJECTED,
                     startMs);
         }
     }
@@ -322,6 +343,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                                         "Lake fallback lookup timed out after "
                                                 + lakeFallbackTimeout),
                                 lakeFallbackTimeoutsTotal,
+                                LakeFallbackOutcome.TIMEOUT,
                                 startMs),
                 lakeFallbackTimeout.toMillis(),
                 TimeUnit.MILLISECONDS);
@@ -330,12 +352,14 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private void completeLakeFallbackSuccessfully(
             CompletableFuture<Collection<RowData>> future, Collection<RowData> rows, long startMs) {
         if (future.complete(rows)) {
+            long latencyMs = elapsedMillis(startMs);
             if (rows.isEmpty()) {
                 lakeFallbackMissesTotal.inc();
             } else {
                 lakeFallbackHitsTotal.inc();
             }
-            recordLakeFallbackCompletion(startMs);
+            periodicLookupStats.recordLakeCompletion(latencyMs, !rows.isEmpty());
+            recordLakeFallbackCompletion(latencyMs);
         }
     }
 
@@ -343,15 +367,18 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             CompletableFuture<Collection<RowData>> future,
             Throwable throwable,
             Counter failureCounter,
+            LakeFallbackOutcome outcome,
             long startMs) {
         if (future.completeExceptionally(throwable)) {
+            long latencyMs = elapsedMillis(startMs);
             failureCounter.inc();
-            recordLakeFallbackCompletion(startMs);
+            periodicLookupStats.recordLakeFailure(latencyMs, outcome);
+            recordLakeFallbackCompletion(latencyMs);
         }
     }
 
-    private void recordLakeFallbackCompletion(long startMs) {
-        lakeFallbackLatencyMs.update(System.currentTimeMillis() - startMs);
+    private void recordLakeFallbackCompletion(long latencyMs) {
+        lakeFallbackLatencyMs.update(latencyMs);
         lakeFallbackPendingCount.decrementAndGet();
     }
 
@@ -652,10 +679,48 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 () -> lakeLookupExecutor == null ? 0 : lakeLookupExecutor.getQueue().size());
     }
 
+    private void startPeriodicStatsReporting() {
+        windowStatsExecutor.scheduleAtFixedRate(
+                () -> {
+                    try {
+                        reportLookupWindowStats(periodicLookupStats.rotate());
+                    } catch (Throwable t) {
+                        LOG.warn(
+                                "Failed to report hybrid lookup window stats for table {}.",
+                                tablePath,
+                                t);
+                    }
+                },
+                LOOKUP_WINDOW_STATS_INTERVAL_MS,
+                LOOKUP_WINDOW_STATS_INTERVAL_MS,
+                TimeUnit.MILLISECONDS);
+    }
+
+    private void reportLookupWindowStats(WindowStatsSnapshot snapshot) {
+        if (!snapshot.hasData()) {
+            return;
+        }
+        LOG.info(
+                "\nHybrid lookup 5-minute stats for table {} (intervalMs={}):\n{}",
+                tablePath,
+                snapshot.windowIntervalMs(),
+                snapshot.toLogTable());
+    }
+
+    private static long elapsedMillis(long startMs) {
+        return Math.max(0L, System.currentTimeMillis() - startMs);
+    }
+
     @Override
     public void close() throws Exception {
         LOG.info("Closing hybrid lake async lookup function for table {}.", tablePath);
         closed = true;
+        if (periodicLookupStats != null) {
+            reportLookupWindowStats(periodicLookupStats.rotate());
+        }
+        if (windowStatsExecutor != null) {
+            shutdownExecutor("hybrid lookup window stats", windowStatsExecutor);
+        }
         if (lakeLookupExecutor != null) {
             shutdownExecutor("lake fallback lookup", lakeLookupExecutor);
         }
@@ -855,6 +920,387 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         @Override
         public long getMin() {
             return values.length == 0 ? 0 : values[0];
+        }
+    }
+
+    private enum LakeFallbackOutcome {
+        FAILURE,
+        TIMEOUT,
+        REJECTED
+    }
+
+    private static class PeriodicLookupStats {
+        private final Object lock = new Object();
+
+        private MutableWindowStats current = new MutableWindowStats(System.currentTimeMillis());
+
+        private void recordFlussCompletion(long latencyMs, boolean hit) {
+            synchronized (lock) {
+                current.flussTotal++;
+                if (hit) {
+                    current.flussHits++;
+                } else {
+                    current.flussMisses++;
+                }
+                current.flussLatency.record(latencyMs);
+            }
+        }
+
+        private void recordFlussFailure(long latencyMs) {
+            synchronized (lock) {
+                current.flussTotal++;
+                current.flussFailures++;
+                current.flussLatency.record(latencyMs);
+            }
+        }
+
+        private void recordLakeRequest() {
+            synchronized (lock) {
+                current.lakeRequests++;
+            }
+        }
+
+        private void recordLakeCompletion(long latencyMs, boolean hit) {
+            synchronized (lock) {
+                current.lakeCompletions++;
+                if (hit) {
+                    current.lakeHits++;
+                } else {
+                    current.lakeMisses++;
+                }
+                current.lakeLatency.record(latencyMs);
+            }
+        }
+
+        private void recordLakeFailure(long latencyMs, LakeFallbackOutcome outcome) {
+            synchronized (lock) {
+                current.lakeCompletions++;
+                current.lakeFailures++;
+                if (outcome == LakeFallbackOutcome.TIMEOUT) {
+                    current.lakeTimeouts++;
+                } else if (outcome == LakeFallbackOutcome.REJECTED) {
+                    current.lakeRejected++;
+                }
+                current.lakeLatency.record(latencyMs);
+            }
+        }
+
+        private WindowStatsSnapshot rotate() {
+            synchronized (lock) {
+                long now = System.currentTimeMillis();
+                WindowStatsSnapshot snapshot = current.toSnapshot(now);
+                current = new MutableWindowStats(now);
+                return snapshot;
+            }
+        }
+    }
+
+    private static class MutableWindowStats {
+        private final long windowStartMs;
+        private final SampledLatencyStats flussLatency =
+                new SampledLatencyStats(LOOKUP_WINDOW_LATENCY_SAMPLE_SIZE);
+        private final SampledLatencyStats lakeLatency =
+                new SampledLatencyStats(LOOKUP_WINDOW_LATENCY_SAMPLE_SIZE);
+
+        private long flussTotal;
+        private long flussHits;
+        private long flussMisses;
+        private long flussFailures;
+        private long lakeRequests;
+        private long lakeCompletions;
+        private long lakeHits;
+        private long lakeMisses;
+        private long lakeFailures;
+        private long lakeTimeouts;
+        private long lakeRejected;
+
+        private MutableWindowStats(long windowStartMs) {
+            this.windowStartMs = windowStartMs;
+        }
+
+        private WindowStatsSnapshot toSnapshot(long windowEndMs) {
+            return new WindowStatsSnapshot(
+                    windowStartMs,
+                    windowEndMs,
+                    flussTotal,
+                    flussHits,
+                    flussMisses,
+                    flussFailures,
+                    flussLatency.toSnapshot(),
+                    lakeRequests,
+                    lakeCompletions,
+                    lakeHits,
+                    lakeMisses,
+                    lakeFailures,
+                    lakeTimeouts,
+                    lakeRejected,
+                    lakeLatency.toSnapshot());
+        }
+    }
+
+    private static class SampledLatencyStats {
+        private final long[] samples;
+        private int position;
+        private int sampleSize;
+        private long count;
+        private long sum;
+        private long max;
+
+        private SampledLatencyStats(int sampleCapacity) {
+            this.samples = new long[sampleCapacity];
+        }
+
+        private void record(long value) {
+            long latencyMs = Math.max(0L, value);
+            count++;
+            sum += latencyMs;
+            max = Math.max(max, latencyMs);
+
+            samples[position] = latencyMs;
+            position = (position + 1) % samples.length;
+            if (sampleSize < samples.length) {
+                sampleSize++;
+            }
+        }
+
+        private LatencyStatsSnapshot toSnapshot() {
+            if (count == 0) {
+                return LatencyStatsSnapshot.empty();
+            }
+            long[] snapshot = Arrays.copyOf(samples, sampleSize);
+            Arrays.sort(snapshot);
+            return new LatencyStatsSnapshot(
+                    (double) sum / count,
+                    max,
+                    quantile(snapshot, 0.50),
+                    quantile(snapshot, 0.95),
+                    quantile(snapshot, 0.99));
+        }
+
+        private static long quantile(long[] sortedValues, double quantile) {
+            if (sortedValues.length == 0) {
+                return 0L;
+            }
+            int index = (int) Math.ceil(quantile * sortedValues.length) - 1;
+            index = Math.max(0, Math.min(index, sortedValues.length - 1));
+            return sortedValues[index];
+        }
+    }
+
+    private static class WindowStatsSnapshot {
+        private final long windowStartMs;
+        private final long windowEndMs;
+        private final long flussTotal;
+        private final long flussHits;
+        private final long flussMisses;
+        private final long flussFailures;
+        private final LatencyStatsSnapshot flussLatency;
+        private final long lakeRequests;
+        private final long lakeCompletions;
+        private final long lakeHits;
+        private final long lakeMisses;
+        private final long lakeFailures;
+        private final long lakeTimeouts;
+        private final long lakeRejected;
+        private final LatencyStatsSnapshot lakeLatency;
+
+        private WindowStatsSnapshot(
+                long windowStartMs,
+                long windowEndMs,
+                long flussTotal,
+                long flussHits,
+                long flussMisses,
+                long flussFailures,
+                LatencyStatsSnapshot flussLatency,
+                long lakeRequests,
+                long lakeCompletions,
+                long lakeHits,
+                long lakeMisses,
+                long lakeFailures,
+                long lakeTimeouts,
+                long lakeRejected,
+                LatencyStatsSnapshot lakeLatency) {
+            this.windowStartMs = windowStartMs;
+            this.windowEndMs = windowEndMs;
+            this.flussTotal = flussTotal;
+            this.flussHits = flussHits;
+            this.flussMisses = flussMisses;
+            this.flussFailures = flussFailures;
+            this.flussLatency = lakeFallbackSafe(flussLatency);
+            this.lakeRequests = lakeRequests;
+            this.lakeCompletions = lakeCompletions;
+            this.lakeHits = lakeHits;
+            this.lakeMisses = lakeMisses;
+            this.lakeFailures = lakeFailures;
+            this.lakeTimeouts = lakeTimeouts;
+            this.lakeRejected = lakeRejected;
+            this.lakeLatency = lakeFallbackSafe(lakeLatency);
+        }
+
+        private static WindowStatsSnapshot empty() {
+            return new WindowStatsSnapshot(
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    LatencyStatsSnapshot.empty(),
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    0L,
+                    LatencyStatsSnapshot.empty());
+        }
+
+        private long windowIntervalMs() {
+            return Math.max(0L, windowEndMs - windowStartMs);
+        }
+
+        private boolean hasData() {
+            return flussTotal > 0 || lakeRequests > 0 || lakeCompletions > 0;
+        }
+
+        private String toLogTable() {
+            String[] headers = {
+                "store",
+                "requests",
+                "total",
+                "hits",
+                "misses",
+                "failures",
+                "timeouts",
+                "rejected",
+                "avgMs",
+                "maxMs",
+                "p50Ms",
+                "p95Ms",
+                "p99Ms"
+            };
+            String[][] rows = {
+                {
+                    "fluss",
+                    "-",
+                    String.valueOf(flussTotal),
+                    String.valueOf(flussHits),
+                    String.valueOf(flussMisses),
+                    String.valueOf(flussFailures),
+                    "-",
+                    "-",
+                    formatLatency(flussLatency.avg),
+                    String.valueOf(flussLatency.max),
+                    String.valueOf(flussLatency.p50),
+                    String.valueOf(flussLatency.p95),
+                    String.valueOf(flussLatency.p99)
+                },
+                {
+                    "lake",
+                    String.valueOf(lakeRequests),
+                    String.valueOf(lakeCompletions),
+                    String.valueOf(lakeHits),
+                    String.valueOf(lakeMisses),
+                    String.valueOf(lakeFailures),
+                    String.valueOf(lakeTimeouts),
+                    String.valueOf(lakeRejected),
+                    formatLatency(lakeLatency.avg),
+                    String.valueOf(lakeLatency.max),
+                    String.valueOf(lakeLatency.p50),
+                    String.valueOf(lakeLatency.p95),
+                    String.valueOf(lakeLatency.p99)
+                }
+            };
+            int[] columnWidths = columnWidths(headers, rows);
+            StringBuilder builder = new StringBuilder();
+            appendRow(builder, headers, columnWidths);
+            appendSeparator(builder, columnWidths);
+            for (String[] row : rows) {
+                appendRow(builder, row, columnWidths);
+            }
+            return builder.toString();
+        }
+
+        private static int[] columnWidths(String[] headers, String[][] rows) {
+            int[] widths = new int[headers.length];
+            for (int i = 0; i < headers.length; i++) {
+                widths[i] = headers[i].length();
+            }
+            for (String[] row : rows) {
+                for (int i = 0; i < row.length; i++) {
+                    widths[i] = Math.max(widths[i], row[i].length());
+                }
+            }
+            return widths;
+        }
+
+        private static void appendRow(StringBuilder builder, String[] values, int[] widths) {
+            builder.append("| ");
+            for (int i = 0; i < values.length; i++) {
+                String value =
+                        i == 0 ? padRight(values[i], widths[i]) : padLeft(values[i], widths[i]);
+                builder.append(value).append(" | ");
+            }
+            builder.setLength(builder.length() - 1);
+            builder.append('\n');
+        }
+
+        private static void appendSeparator(StringBuilder builder, int[] widths) {
+            builder.append("|");
+            for (int width : widths) {
+                builder.append(repeat('-', width + 2)).append("|");
+            }
+            builder.append('\n');
+        }
+
+        private static String padLeft(String value, int width) {
+            if (value.length() >= width) {
+                return value;
+            }
+            return repeat(' ', width - value.length()) + value;
+        }
+
+        private static String padRight(String value, int width) {
+            if (value.length() >= width) {
+                return value;
+            }
+            return value + repeat(' ', width - value.length());
+        }
+
+        private static String repeat(char character, int count) {
+            char[] characters = new char[count];
+            Arrays.fill(characters, character);
+            return new String(characters);
+        }
+
+        private static String formatLatency(double latencyMs) {
+            return String.format(Locale.ROOT, "%.2f", latencyMs);
+        }
+
+        private static LatencyStatsSnapshot lakeFallbackSafe(
+                @Nullable LatencyStatsSnapshot snapshot) {
+            return snapshot == null ? LatencyStatsSnapshot.empty() : snapshot;
+        }
+    }
+
+    private static class LatencyStatsSnapshot {
+        private final double avg;
+        private final long max;
+        private final long p50;
+        private final long p95;
+        private final long p99;
+
+        private LatencyStatsSnapshot(double avg, long max, long p50, long p95, long p99) {
+            this.avg = avg;
+            this.max = max;
+            this.p50 = p50;
+            this.p95 = p95;
+            this.p99 = p99;
+        }
+
+        private static LatencyStatsSnapshot empty() {
+            return new LatencyStatsSnapshot(0.0, 0L, 0L, 0L, 0L);
         }
     }
 
