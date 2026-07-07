@@ -48,7 +48,9 @@ import org.apache.fluss.utils.ExecutorUtils;
 import org.apache.fluss.utils.clock.Clock;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
+import org.apache.fluss.utils.concurrent.FlussScheduler;
 import org.apache.fluss.utils.concurrent.FutureUtils;
+import org.apache.fluss.utils.concurrent.Scheduler;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -66,6 +68,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static org.apache.fluss.config.ConfigOptions.BACKGROUND_THREADS;
 import static org.apache.fluss.config.FlussConfigUtils.validateCoordinatorConfigs;
 
 /**
@@ -131,6 +134,10 @@ public class CoordinatorServer extends ServerBase {
     @GuardedBy("lock")
     private LakeTableTieringManager lakeTableTieringManager;
 
+    /** Shared scheduler for lightweight coordinator background tasks. */
+    @GuardedBy("lock")
+    private Scheduler scheduler;
+
     @GuardedBy("lock")
     private ExecutorService ioExecutor;
 
@@ -174,6 +181,9 @@ public class CoordinatorServer extends ServerBase {
             LOG.info("Initializing Coordinator services.");
             List<Endpoint> endpoints = Endpoint.loadBindEndpoints(conf, ServerType.COORDINATOR);
             this.serverId = UUID.randomUUID().toString();
+
+            this.scheduler = new FlussScheduler(conf.get(BACKGROUND_THREADS));
+            scheduler.startup();
 
             // for metrics
             this.metricRegistry = MetricRegistry.create(conf, pluginManager);
@@ -281,7 +291,8 @@ public class CoordinatorServer extends ServerBase {
                             conf,
                             ioExecutor,
                             metadataManager,
-                            kvSnapshotLeaseManager);
+                            kvSnapshotLeaseManager,
+                            scheduler);
             coordinatorEventProcessor.startup();
 
             createDefaultDatabase();
@@ -380,6 +391,17 @@ public class CoordinatorServer extends ServerBase {
     CompletableFuture<Void> stopServices() {
         synchronized (lock) {
             Throwable exception = null;
+
+            try {
+                // We must shut down the scheduler early because otherwise, the scheduler could
+                // touch other resources that might have been shutdown and cause exceptions.
+                if (scheduler != null) {
+                    scheduler.shutdown();
+                    scheduler = null;
+                }
+            } catch (Throwable t) {
+                exception = ExceptionUtils.firstOrSuppressed(t, exception);
+            }
 
             try {
                 if (serverMetricGroup != null) {

@@ -17,16 +17,23 @@
 
 package org.apache.fluss.server.coordinator;
 
+import org.apache.fluss.cluster.Endpoint;
+import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TableBucketReplica;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.types.DataTypes;
 
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.Collections;
 
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
@@ -68,6 +75,41 @@ class CoordinatorContextTest {
         assertThat(context.getLakeTableCount()).isEqualTo(2);
     }
 
+    @Test
+    void testOfflineReplicasOnLiveTabletServersOnlyReturnsLiveServers() {
+        CoordinatorContext context = new CoordinatorContext();
+        TableBucket liveBucket = new TableBucket(1L, 0);
+        TableBucket deadBucket = new TableBucket(1L, 1);
+
+        context.setLiveTabletServers(Arrays.asList(createTabletServer(0), createTabletServer(1)));
+        context.addOfflineBucketInServer(liveBucket, 0);
+        context.addOfflineBucketInServer(deadBucket, 2);
+
+        assertThat(context.offlineReplicasOnLiveTabletServers())
+                .containsExactly(new TableBucketReplica(liveBucket, 0));
+    }
+
+    @Test
+    void testRemoveOfflineBucketInServerForBucket() {
+        CoordinatorContext context = new CoordinatorContext();
+        TableBucket tb1 = new TableBucket(1L, 0);
+        TableBucket tb2 = new TableBucket(1L, 1);
+
+        context.setLiveTabletServers(Collections.singletonList(createTabletServer(0)));
+        context.addOfflineBucketInServer(tb1, 0);
+        context.addOfflineBucketInServer(tb2, 0);
+
+        context.removeOfflineBucketInServer(tb1, 0);
+        assertThat(context.isReplicaOnline(0, tb1)).isTrue();
+        assertThat(context.isReplicaOnline(0, tb2)).isFalse();
+        assertThat(context.offlineReplicasOnLiveTabletServers())
+                .containsExactly(new TableBucketReplica(tb2, 0));
+
+        context.removeOfflineBucketInServer(tb2, 0);
+        assertThat(context.isReplicaOnline(0, tb2)).isTrue();
+        assertThat(context.offlineReplicasOnLiveTabletServers()).isEmpty();
+    }
+
     private TableInfo createTableInfo(long tableId, TablePath tablePath, boolean isLake) {
         TableDescriptor tableDescriptor =
                 TableDescriptor.builder()
@@ -86,5 +128,13 @@ class CoordinatorContextTest {
                 DEFAULT_REMOTE_DATA_DIR,
                 System.currentTimeMillis(),
                 System.currentTimeMillis());
+    }
+
+    private ServerInfo createTabletServer(int serverId) {
+        return new ServerInfo(
+                serverId,
+                "RACK" + serverId,
+                Endpoint.fromListenersString("CLIENT://host" + serverId + ":9124"),
+                ServerType.TABLET_SERVER);
     }
 }

@@ -48,7 +48,10 @@ import org.apache.fluss.shaded.guava32.com.google.common.collect.Sets;
 import org.apache.fluss.testutils.common.AllCallbackWrapper;
 import org.apache.fluss.utils.clock.SystemClock;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
+import org.apache.fluss.utils.concurrent.FlussScheduler;
+import org.apache.fluss.utils.concurrent.Scheduler;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -90,6 +93,7 @@ class TableBucketStateMachineTest {
     private LakeTableTieringManager lakeTableTieringManager;
     private CoordinatorMetadataCache serverMetadataCache;
     private KvSnapshotLeaseManager kvSnapshotLeaseManager;
+    private Scheduler scheduler;
 
     @BeforeAll
     static void baseBeforeAll() {
@@ -133,6 +137,16 @@ class TableBucketStateMachineTest {
                         SystemClock.getInstance(),
                         TestingMetricGroups.COORDINATOR_METRICS);
         kvSnapshotLeaseManager.start();
+
+        scheduler = new FlussScheduler(1);
+        scheduler.startup();
+    }
+
+    @AfterEach
+    void afterEach() throws Exception {
+        if (scheduler != null) {
+            scheduler.shutdown();
+        }
     }
 
     @Test
@@ -284,7 +298,8 @@ class TableBucketStateMachineTest {
                                 zookeeperClient,
                                 new Configuration(),
                                 new LakeCatalogDynamicLoader(new Configuration(), null, true)),
-                        kvSnapshotLeaseManager);
+                        kvSnapshotLeaseManager,
+                        scheduler);
         CoordinatorEventManager eventManager =
                 new CoordinatorEventManager(
                         coordinatorEventProcessor, TestingMetricGroups.COORDINATOR_METRICS);

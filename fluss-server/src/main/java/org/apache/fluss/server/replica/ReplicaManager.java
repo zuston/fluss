@@ -1854,7 +1854,11 @@ public class ReplicaManager {
         if (requestLeaderEpoch >= currentLeaderEpoch) {
             if (data.getReplicas().contains(serverId)) {
                 int leaderId = data.getLeader();
-                return leaderId == serverId;
+                boolean becomeLeader = leaderId == serverId;
+                if (becomeLeader) {
+                    ensureWritableForNewKvLeader(replica, requestLeaderEpoch);
+                }
+                return becomeLeader;
             } else {
                 String errorMessage =
                         String.format(
@@ -1873,6 +1877,17 @@ public class ReplicaManager {
             LOG.warn("Ignore the notify leader and isr request because {}", errorMessage);
             throw new FencedLeaderEpochException(errorMessage);
         }
+    }
+
+    private void ensureWritableForNewKvLeader(Replica replica, int requestLeaderEpoch) {
+        if (!replica.isKvTable() || requestLeaderEpoch <= replica.getLeaderEpoch()) {
+            return;
+        }
+
+        // TODO: Once standby replicas maintain local KV snapshots, allow promoting a standby
+        // replica while disk write protection is active because it should not need to download a
+        // large remote snapshot during make-leader.
+        localDiskManager.ensureWritable();
     }
 
     /**
