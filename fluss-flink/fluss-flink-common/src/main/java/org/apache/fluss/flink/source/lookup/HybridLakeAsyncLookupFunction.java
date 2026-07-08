@@ -65,6 +65,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -74,6 +75,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -306,6 +308,8 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         try {
             lakeLookupExecutor.execute(
                     () -> {
+                        periodicLookupStats.recordLakeStageLatency(
+                                LakeLookupStage.QUEUE, elapsedMillis(startMs));
                         try {
                             Collection<RowData> rows =
                                     closed
@@ -411,6 +415,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             return Collections.emptyList();
         }
         LakeSnapshot lakeSnapshot;
+        long stageStartMs = System.currentTimeMillis();
         try {
             lakeSnapshot = admin.getReadableLakeSnapshot(tablePath).get();
         } catch (Exception e) {
@@ -419,29 +424,52 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 return Collections.emptyList();
             }
             throw e;
+        } finally {
+            periodicLookupStats.recordLakeStageLatency(
+                    LakeLookupStage.SNAPSHOT, elapsedMillis(stageStartMs));
         }
 
-        LakeSource<LakeSplit> lakeSource =
-                checkNotNull(
-                        createLakeSource(tablePath, tableOptions),
-                        "Lake source must not be null for lake fallback lookup.");
-        Predicate predicate = createPrimaryKeyPredicate(lookupKey.primaryKeyValues);
-        LakeSource.FilterPushDownResult pushDownResult =
-                lakeSource.withFilters(Collections.singletonList(predicate));
-        if (!pushDownResult.remainingPredicates().isEmpty()) {
-            throw new TableException(
-                    "Lake fallback lookup requires primary-key predicates to be pushed down.");
+        stageStartMs = System.currentTimeMillis();
+        LakeSource<LakeSplit> lakeSource;
+        try {
+            lakeSource =
+                    checkNotNull(
+                            createLakeSource(tablePath, tableOptions),
+                            "Lake source must not be null for lake fallback lookup.");
+            Predicate predicate = createPrimaryKeyPredicate(lookupKey.primaryKeyValues);
+            LakeSource.FilterPushDownResult pushDownResult =
+                    lakeSource.withFilters(Collections.singletonList(predicate));
+            if (!pushDownResult.remainingPredicates().isEmpty()) {
+                throw new TableException(
+                        "Lake fallback lookup requires primary-key predicates to be pushed down.");
+            }
+        } finally {
+            periodicLookupStats.recordLakeStageLatency(
+                    LakeLookupStage.SOURCE_FILTER, elapsedMillis(stageStartMs));
         }
-        Planner<LakeSplit> planner = lakeSource.createPlanner(lakeSnapshot::getSnapshotId);
-        LOG.debug(
-                "Planning lake lookup splits for table {}, snapshot {}, primary key indexes {}, primary key values {}.",
-                tablePath,
-                lakeSnapshot.getSnapshotId(),
-                Arrays.toString(primaryKeyIndexes),
-                Arrays.toString(lookupKey.primaryKeyValues));
-        List<LakeSplit> splits = planner.plan();
-        LakeLookupHandle lakeLookupHandle = lakeLookupThreadLocal.get();
+
+        stageStartMs = System.currentTimeMillis();
+        List<LakeSplit> splits;
+        LakeLookupHandle lakeLookupHandle;
+        try {
+            Planner<LakeSplit> planner = lakeSource.createPlanner(lakeSnapshot::getSnapshotId);
+            LOG.debug(
+                    "Planning lake lookup splits for table {}, snapshot {}, primary key indexes {}, primary key values {}.",
+                    tablePath,
+                    lakeSnapshot.getSnapshotId(),
+                    Arrays.toString(primaryKeyIndexes),
+                    Arrays.toString(lookupKey.primaryKeyValues));
+            splits = planner.plan();
+            lakeLookupHandle = lakeLookupThreadLocal.get();
+        } finally {
+            periodicLookupStats.recordLakeStageLatency(
+                    LakeLookupStage.PLAN, elapsedMillis(stageStartMs));
+        }
+
+        stageStartMs = System.currentTimeMillis();
         synchronized (lakeLookupHandle.lock) {
+            periodicLookupStats.recordLakeStageLatency(
+                    LakeLookupStage.LOCK_WAIT, elapsedMillis(stageStartMs));
             if (closed) {
                 return Collections.emptyList();
             }
@@ -450,35 +478,110 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     tablePath,
                     lakeSnapshot.getSnapshotId(),
                     splits.size());
-            lakeLookupHandle.lookup.refresh(splits);
-            for (LakeSplit split : splits) {
-                if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
-                    continue;
+            stageStartMs = System.currentTimeMillis();
+            try {
+                lakeLookupHandle.lookup.refresh(splits);
+            } finally {
+                periodicLookupStats.recordLakeStageLatency(
+                        LakeLookupStage.REFRESH, elapsedMillis(stageStartMs));
+            }
+            long splitLookupStartMs = System.currentTimeMillis();
+            boolean splitLookupRecorded = false;
+            LakeLookupFileStats fileStats = new LakeLookupFileStats(splits.size());
+            try {
+                for (LakeSplit split : splits) {
+                    if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
+                        continue;
+                    }
+                    fileStats.recordMatchedSplit(split);
+                    LOG.debug(
+                            "Calling lake lookup for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
+                            tablePath,
+                            lakeSnapshot.getSnapshotId(),
+                            split.partition(),
+                            split.bucket(),
+                            Arrays.toString(primaryKeyIndexes),
+                            Arrays.toString(lookupKey.primaryKeyValues));
+                    InternalRow row =
+                            lakeLookupHandle.lookup.lookup(
+                                    split.partition(),
+                                    split.bucket(),
+                                    lookupKey.primaryKeyValues,
+                                    primaryKeyIndexes);
+                    if (row == null) {
+                        continue;
+                    }
+                    periodicLookupStats.recordLakeStageLatency(
+                            LakeLookupStage.SPLIT_LOOKUP, elapsedMillis(splitLookupStartMs));
+                    splitLookupRecorded = true;
+
+                    stageStartMs = System.currentTimeMillis();
+                    try {
+                        RowData flinkRow = flussRowToFlinkRowConverter.toFlinkRowData(row);
+                        if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
+                            return Collections.singletonList(flinkRow);
+                        }
+                    } finally {
+                        periodicLookupStats.recordLakeStageLatency(
+                                LakeLookupStage.ROW_CONVERT_FILTER, elapsedMillis(stageStartMs));
+                    }
+                    splitLookupStartMs = System.currentTimeMillis();
+                    splitLookupRecorded = false;
                 }
-                LOG.debug(
-                        "Calling lake lookup for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
-                        tablePath,
-                        lakeSnapshot.getSnapshotId(),
-                        split.partition(),
-                        split.bucket(),
-                        Arrays.toString(primaryKeyIndexes),
-                        Arrays.toString(lookupKey.primaryKeyValues));
-                InternalRow row =
-                        lakeLookupHandle.lookup.lookup(
-                                split.partition(),
-                                split.bucket(),
-                                lookupKey.primaryKeyValues,
-                                primaryKeyIndexes);
-                if (row == null) {
-                    continue;
-                }
-                RowData flinkRow = flussRowToFlinkRowConverter.toFlinkRowData(row);
-                if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
-                    return Collections.singletonList(flinkRow);
+            } finally {
+                periodicLookupStats.recordLakeFileStats(fileStats);
+                if (!splitLookupRecorded) {
+                    periodicLookupStats.recordLakeStageLatency(
+                            LakeLookupStage.SPLIT_LOOKUP, elapsedMillis(splitLookupStartMs));
                 }
             }
         }
         return Collections.emptyList();
+    }
+
+    private static class LakeLookupFileStats {
+        private final int plannedSplits;
+        private int matchedSplits;
+        private long dataFiles;
+        private long fileSizeBytes;
+        private long rowCount;
+
+        private LakeLookupFileStats(int plannedSplits) {
+            this.plannedSplits = plannedSplits;
+        }
+
+        private void recordMatchedSplit(LakeSplit split) {
+            matchedSplits++;
+            collectDataFileStats(split);
+        }
+
+        private void collectDataFileStats(LakeSplit split) {
+            try {
+                Method dataSplitMethod = split.getClass().getMethod("dataSplit");
+                Object dataSplit = dataSplitMethod.invoke(split);
+                if (dataSplit == null) {
+                    return;
+                }
+                Method dataFilesMethod = dataSplit.getClass().getMethod("dataFiles");
+                Object dataFilesObject = dataFilesMethod.invoke(dataSplit);
+                if (!(dataFilesObject instanceof Iterable)) {
+                    return;
+                }
+                for (Object dataFile : (Iterable<?>) dataFilesObject) {
+                    dataFiles++;
+                    fileSizeBytes += invokeLong(dataFile, "fileSize");
+                    rowCount += invokeLong(dataFile, "rowCount");
+                }
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                // Lake split implementations are plugin-specific; file stats are best-effort.
+            }
+        }
+
+        private static long invokeLong(Object target, String methodName)
+                throws ReflectiveOperationException {
+            Object value = target.getClass().getMethod(methodName).invoke(target);
+            return value instanceof Number ? ((Number) value).longValue() : 0L;
+        }
     }
 
     private boolean matchesLookupPartition(LakeSplit split, String partitionValue) {
@@ -978,6 +1081,23 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         REJECTED
     }
 
+    private enum LakeLookupStage {
+        QUEUE("queue"),
+        SNAPSHOT("snapshot"),
+        SOURCE_FILTER("sourceFilter"),
+        PLAN("plan"),
+        LOCK_WAIT("lockWait"),
+        REFRESH("refresh"),
+        SPLIT_LOOKUP("splitLookup"),
+        ROW_CONVERT_FILTER("rowConvertFilter");
+
+        private final String displayName;
+
+        LakeLookupStage(String displayName) {
+            this.displayName = displayName;
+        }
+    }
+
     private static class PeriodicLookupStats {
         private final Object lock = new Object();
 
@@ -1034,6 +1154,18 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             }
         }
 
+        private void recordLakeStageLatency(LakeLookupStage stage, long latencyMs) {
+            synchronized (lock) {
+                current.recordLakeStageLatency(stage, latencyMs);
+            }
+        }
+
+        private void recordLakeFileStats(LakeLookupFileStats fileStats) {
+            synchronized (lock) {
+                current.recordLakeFileStats(fileStats);
+            }
+        }
+
         private WindowStatsSnapshot rotate() {
             synchronized (lock) {
                 long now = System.currentTimeMillis();
@@ -1050,6 +1182,9 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 new SampledLatencyStats(LOOKUP_WINDOW_LATENCY_SAMPLE_SIZE);
         private final SampledLatencyStats lakeLatency =
                 new SampledLatencyStats(LOOKUP_WINDOW_LATENCY_SAMPLE_SIZE);
+        private final EnumMap<LakeLookupStage, SampledLatencyStats> lakeStageLatencies =
+                new EnumMap<>(LakeLookupStage.class);
+        private final LakeFileStatsAccumulator lakeFileStats = new LakeFileStatsAccumulator();
 
         private long flussTotal;
         private long flussHits;
@@ -1065,9 +1200,27 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
 
         private MutableWindowStats(long windowStartMs) {
             this.windowStartMs = windowStartMs;
+            for (LakeLookupStage stage : LakeLookupStage.values()) {
+                lakeStageLatencies.put(
+                        stage, new SampledLatencyStats(LOOKUP_WINDOW_LATENCY_SAMPLE_SIZE));
+            }
+        }
+
+        private void recordLakeStageLatency(LakeLookupStage stage, long latencyMs) {
+            lakeStageLatencies.get(stage).record(latencyMs);
+        }
+
+        private void recordLakeFileStats(LakeLookupFileStats fileStats) {
+            lakeFileStats.record(fileStats);
         }
 
         private WindowStatsSnapshot toSnapshot(long windowEndMs) {
+            EnumMap<LakeLookupStage, LatencyStatsSnapshot> lakeStageLatencySnapshots =
+                    new EnumMap<>(LakeLookupStage.class);
+            for (Map.Entry<LakeLookupStage, SampledLatencyStats> entry :
+                    lakeStageLatencies.entrySet()) {
+                lakeStageLatencySnapshots.put(entry.getKey(), entry.getValue().toSnapshot());
+            }
             return new WindowStatsSnapshot(
                     windowStartMs,
                     windowEndMs,
@@ -1083,7 +1236,52 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     lakeFailures,
                     lakeTimeouts,
                     lakeRejected,
-                    lakeLatency.toSnapshot());
+                    lakeLatency.toSnapshot(),
+                    lakeStageLatencySnapshots,
+                    lakeFileStats.toSnapshot());
+        }
+    }
+
+    private static class LakeFileStatsAccumulator {
+        private long samples;
+        private long plannedSplitsSum;
+        private long plannedSplitsMax;
+        private long matchedSplitsSum;
+        private long matchedSplitsMax;
+        private long dataFilesSum;
+        private long dataFilesMax;
+        private long fileSizeBytesSum;
+        private long fileSizeBytesMax;
+        private long rowCountSum;
+        private long rowCountMax;
+
+        private void record(LakeLookupFileStats stats) {
+            samples++;
+            plannedSplitsSum += stats.plannedSplits;
+            plannedSplitsMax = Math.max(plannedSplitsMax, stats.plannedSplits);
+            matchedSplitsSum += stats.matchedSplits;
+            matchedSplitsMax = Math.max(matchedSplitsMax, stats.matchedSplits);
+            dataFilesSum += stats.dataFiles;
+            dataFilesMax = Math.max(dataFilesMax, stats.dataFiles);
+            fileSizeBytesSum += stats.fileSizeBytes;
+            fileSizeBytesMax = Math.max(fileSizeBytesMax, stats.fileSizeBytes);
+            rowCountSum += stats.rowCount;
+            rowCountMax = Math.max(rowCountMax, stats.rowCount);
+        }
+
+        private LakeFileStatsSnapshot toSnapshot() {
+            return new LakeFileStatsSnapshot(
+                    samples,
+                    plannedSplitsSum,
+                    plannedSplitsMax,
+                    matchedSplitsSum,
+                    matchedSplitsMax,
+                    dataFilesSum,
+                    dataFilesMax,
+                    fileSizeBytesSum,
+                    fileSizeBytesMax,
+                    rowCountSum,
+                    rowCountMax);
         }
     }
 
@@ -1119,6 +1317,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             long[] snapshot = Arrays.copyOf(samples, sampleSize);
             Arrays.sort(snapshot);
             return new LatencyStatsSnapshot(
+                    count,
                     (double) sum / count,
                     max,
                     quantile(snapshot, 0.50),
@@ -1152,6 +1351,8 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         private final long lakeTimeouts;
         private final long lakeRejected;
         private final LatencyStatsSnapshot lakeLatency;
+        private final EnumMap<LakeLookupStage, LatencyStatsSnapshot> lakeStageLatencies;
+        private final LakeFileStatsSnapshot lakeFileStats;
 
         private WindowStatsSnapshot(
                 long windowStartMs,
@@ -1168,7 +1369,9 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 long lakeFailures,
                 long lakeTimeouts,
                 long lakeRejected,
-                LatencyStatsSnapshot lakeLatency) {
+                LatencyStatsSnapshot lakeLatency,
+                EnumMap<LakeLookupStage, LatencyStatsSnapshot> lakeStageLatencies,
+                LakeFileStatsSnapshot lakeFileStats) {
             this.windowStartMs = windowStartMs;
             this.windowEndMs = windowEndMs;
             this.flussTotal = flussTotal;
@@ -1184,9 +1387,20 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             this.lakeTimeouts = lakeTimeouts;
             this.lakeRejected = lakeRejected;
             this.lakeLatency = lakeFallbackSafe(lakeLatency);
+            this.lakeStageLatencies = new EnumMap<>(LakeLookupStage.class);
+            for (LakeLookupStage stage : LakeLookupStage.values()) {
+                this.lakeStageLatencies.put(stage, lakeFallbackSafe(lakeStageLatencies.get(stage)));
+            }
+            this.lakeFileStats =
+                    lakeFileStats == null ? LakeFileStatsSnapshot.empty() : lakeFileStats;
         }
 
         private static WindowStatsSnapshot empty() {
+            EnumMap<LakeLookupStage, LatencyStatsSnapshot> emptyStageLatencies =
+                    new EnumMap<>(LakeLookupStage.class);
+            for (LakeLookupStage stage : LakeLookupStage.values()) {
+                emptyStageLatencies.put(stage, LatencyStatsSnapshot.empty());
+            }
             return new WindowStatsSnapshot(
                     0L,
                     0L,
@@ -1202,7 +1416,9 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     0L,
                     0L,
                     0L,
-                    LatencyStatsSnapshot.empty());
+                    LatencyStatsSnapshot.empty(),
+                    emptyStageLatencies,
+                    LakeFileStatsSnapshot.empty());
         }
 
         private long windowIntervalMs() {
@@ -1268,7 +1484,79 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             for (String[] row : rows) {
                 appendRow(builder, row, columnWidths);
             }
+            appendLakeStageLatencyTable(builder);
+            appendLakeFileStatsTable(builder);
             return builder.toString();
+        }
+
+        private void appendLakeStageLatencyTable(StringBuilder builder) {
+            boolean hasStageData = false;
+            for (LatencyStatsSnapshot snapshot : lakeStageLatencies.values()) {
+                if (snapshot.count > 0) {
+                    hasStageData = true;
+                    break;
+                }
+            }
+            if (!hasStageData) {
+                return;
+            }
+
+            builder.append('\n').append("lake stages:\n");
+            String[] headers = {"stage", "samples", "avgMs", "maxMs", "p50Ms", "p95Ms", "p99Ms"};
+            String[][] rows = new String[LakeLookupStage.values().length][headers.length];
+            int rowIndex = 0;
+            for (LakeLookupStage stage : LakeLookupStage.values()) {
+                LatencyStatsSnapshot latency = lakeStageLatencies.get(stage);
+                rows[rowIndex++] =
+                        new String[] {
+                            stage.displayName,
+                            String.valueOf(latency.count),
+                            formatLatency(latency.avg),
+                            String.valueOf(latency.max),
+                            String.valueOf(latency.p50),
+                            String.valueOf(latency.p95),
+                            String.valueOf(latency.p99)
+                        };
+            }
+            int[] columnWidths = columnWidths(headers, rows);
+            appendRow(builder, headers, columnWidths);
+            appendSeparator(builder, columnWidths);
+            for (String[] row : rows) {
+                appendRow(builder, row, columnWidths);
+            }
+        }
+
+        private void appendLakeFileStatsTable(StringBuilder builder) {
+            if (lakeFileStats.samples == 0) {
+                return;
+            }
+
+            builder.append('\n').append("lake file stats:\n");
+            String[] headers = {"metric", "samples", "avg", "max"};
+            String[][] rows = {
+                lakeFileStats.toRow(
+                        "plannedSplits",
+                        lakeFileStats.plannedSplitsSum,
+                        lakeFileStats.plannedSplitsMax),
+                lakeFileStats.toRow(
+                        "matchedSplits",
+                        lakeFileStats.matchedSplitsSum,
+                        lakeFileStats.matchedSplitsMax),
+                lakeFileStats.toRow(
+                        "dataFiles", lakeFileStats.dataFilesSum, lakeFileStats.dataFilesMax),
+                lakeFileStats.toRow(
+                        "fileSizeBytes",
+                        lakeFileStats.fileSizeBytesSum,
+                        lakeFileStats.fileSizeBytesMax),
+                lakeFileStats.toRow(
+                        "rowCount", lakeFileStats.rowCountSum, lakeFileStats.rowCountMax)
+            };
+            int[] columnWidths = columnWidths(headers, rows);
+            appendRow(builder, headers, columnWidths);
+            appendSeparator(builder, columnWidths);
+            for (String[] row : rows) {
+                appendRow(builder, row, columnWidths);
+            }
         }
 
         private static int[] columnWidths(String[] headers, String[][] rows) {
@@ -1334,13 +1622,16 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     }
 
     private static class LatencyStatsSnapshot {
+        private final long count;
         private final double avg;
         private final long max;
         private final long p50;
         private final long p95;
         private final long p99;
 
-        private LatencyStatsSnapshot(double avg, long max, long p50, long p95, long p99) {
+        private LatencyStatsSnapshot(
+                long count, double avg, long max, long p50, long p95, long p99) {
+            this.count = count;
             this.avg = avg;
             this.max = max;
             this.p50 = p50;
@@ -1349,7 +1640,60 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         }
 
         private static LatencyStatsSnapshot empty() {
-            return new LatencyStatsSnapshot(0.0, 0L, 0L, 0L, 0L);
+            return new LatencyStatsSnapshot(0L, 0.0, 0L, 0L, 0L, 0L);
+        }
+    }
+
+    private static class LakeFileStatsSnapshot {
+        private final long samples;
+        private final long plannedSplitsSum;
+        private final long plannedSplitsMax;
+        private final long matchedSplitsSum;
+        private final long matchedSplitsMax;
+        private final long dataFilesSum;
+        private final long dataFilesMax;
+        private final long fileSizeBytesSum;
+        private final long fileSizeBytesMax;
+        private final long rowCountSum;
+        private final long rowCountMax;
+
+        private LakeFileStatsSnapshot(
+                long samples,
+                long plannedSplitsSum,
+                long plannedSplitsMax,
+                long matchedSplitsSum,
+                long matchedSplitsMax,
+                long dataFilesSum,
+                long dataFilesMax,
+                long fileSizeBytesSum,
+                long fileSizeBytesMax,
+                long rowCountSum,
+                long rowCountMax) {
+            this.samples = samples;
+            this.plannedSplitsSum = plannedSplitsSum;
+            this.plannedSplitsMax = plannedSplitsMax;
+            this.matchedSplitsSum = matchedSplitsSum;
+            this.matchedSplitsMax = matchedSplitsMax;
+            this.dataFilesSum = dataFilesSum;
+            this.dataFilesMax = dataFilesMax;
+            this.fileSizeBytesSum = fileSizeBytesSum;
+            this.fileSizeBytesMax = fileSizeBytesMax;
+            this.rowCountSum = rowCountSum;
+            this.rowCountMax = rowCountMax;
+        }
+
+        private String[] toRow(String metric, long sum, long max) {
+            return new String[] {
+                metric, String.valueOf(samples), formatAverage(sum, samples), String.valueOf(max)
+            };
+        }
+
+        private static String formatAverage(long sum, long count) {
+            return count == 0 ? "0.00" : String.format(Locale.ROOT, "%.2f", (double) sum / count);
+        }
+
+        private static LakeFileStatsSnapshot empty() {
+            return new LakeFileStatsSnapshot(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
         }
     }
 
