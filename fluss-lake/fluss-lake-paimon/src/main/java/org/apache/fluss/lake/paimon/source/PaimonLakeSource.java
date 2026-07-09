@@ -29,13 +29,21 @@ import org.apache.fluss.lake.source.SupportsLakeLookup;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 
+import org.apache.paimon.Snapshot;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
+import org.apache.paimon.fs.Path;
+import org.apache.paimon.options.MemorySize;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.PredicateBuilder;
+import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Cache;
+import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Caffeine;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.types.RowType;
+import org.apache.paimon.utils.SegmentsCache;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
@@ -58,7 +66,24 @@ import static org.apache.fluss.utils.MapUtils.newConcurrentHashMap;
  */
 public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLookup<PaimonSplit> {
     private static final long serialVersionUID = 1L;
+    private static final Logger LOG = LoggerFactory.getLogger(PaimonLakeSource.class);
+
+    private static final String METADATA_CACHE_ENABLED_KEY = "fluss.paimon.metadata-cache.enabled";
+    private static final String METADATA_CACHE_MAX_MEMORY_KEY =
+            "fluss.paimon.metadata-cache.max-memory-size";
+    private static final String METADATA_CACHE_MAX_FILE_KEY =
+            "fluss.paimon.metadata-cache.max-file-size";
+    private static final String METADATA_CACHE_SNAPSHOT_MAX_ENTRIES_KEY =
+            "fluss.paimon.metadata-cache.snapshot-max-entries";
+    private static final String DEFAULT_METADATA_CACHE_MAX_MEMORY = "64mb";
+    private static final String DEFAULT_METADATA_CACHE_MAX_FILE = "16mb";
+    private static final int DEFAULT_METADATA_CACHE_SNAPSHOT_MAX_ENTRIES = 1024;
+
     private static final ConcurrentMap<TableCacheKey, FileStoreTable> TABLE_CACHE =
+            newConcurrentHashMap();
+    private static final ConcurrentMap<TableCacheKey, SegmentsCache<Path>> MANIFEST_CACHE =
+            newConcurrentHashMap();
+    private static final ConcurrentMap<TableCacheKey, Cache<Path, Snapshot>> SNAPSHOT_CACHE =
             newConcurrentHashMap();
 
     private final Configuration paimonConfig;
@@ -129,13 +154,13 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
 
     @Override
     public LakeLookup<PaimonSplit> createLookup() throws IOException {
-        return createLookup(null);
+        return createLookup(new String[0]);
     }
 
     @Override
-    public LakeLookup<PaimonSplit> createLookup(@Nullable String ioTmpDir) throws IOException {
+    public LakeLookup<PaimonSplit> createLookup(String[] ioTmpDirs) throws IOException {
         try {
-            return new PaimonLakeLookup(getTable(), project, ioTmpDir);
+            return new PaimonLakeLookup(getTable(), project, ioTmpDirs);
         } catch (Exception e) {
             throw new IOException("Fail to create lookup.", e);
         }
@@ -157,10 +182,83 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
 
     private FileStoreTable loadTable() {
         try (Catalog catalog = getCatalog()) {
-            return getTable(catalog, tablePath);
+            FileStoreTable fileStoreTable = getTable(catalog, tablePath);
+            configureMetadataCache(fileStoreTable);
+            return fileStoreTable;
         } catch (Exception e) {
             throw new RuntimeException("Fail to get table " + tablePath, e);
         }
+    }
+
+    private void configureMetadataCache(FileStoreTable fileStoreTable) {
+        if (!Boolean.parseBoolean(
+                getPaimonConfig(METADATA_CACHE_ENABLED_KEY, Boolean.TRUE.toString()))) {
+            return;
+        }
+
+        MemorySize manifestCacheMaxMemory =
+                getPaimonMemorySize(
+                        METADATA_CACHE_MAX_MEMORY_KEY, DEFAULT_METADATA_CACHE_MAX_MEMORY);
+        if (manifestCacheMaxMemory.getBytes() > 0) {
+            SegmentsCache<Path> manifestCache =
+                    MANIFEST_CACHE.computeIfAbsent(
+                            tableCacheKey,
+                            ignored -> {
+                                MemorySize maxFileSize =
+                                        getPaimonMemorySize(
+                                                METADATA_CACHE_MAX_FILE_KEY,
+                                                DEFAULT_METADATA_CACHE_MAX_FILE);
+                                LOG.info(
+                                        "Created Paimon manifest metadata cache for table {}, maxMemory {}, maxFileSize {}.",
+                                        tablePath,
+                                        manifestCacheMaxMemory,
+                                        maxFileSize);
+                                return SegmentsCache.create(
+                                        manifestCacheMaxMemory, maxFileSize.getBytes());
+                            });
+            fileStoreTable.setManifestCache(manifestCache);
+        }
+
+        int snapshotMaxEntries =
+                getPositiveInt(
+                        METADATA_CACHE_SNAPSHOT_MAX_ENTRIES_KEY,
+                        DEFAULT_METADATA_CACHE_SNAPSHOT_MAX_ENTRIES);
+        if (snapshotMaxEntries > 0) {
+            Cache<Path, Snapshot> snapshotCache =
+                    SNAPSHOT_CACHE.computeIfAbsent(
+                            tableCacheKey,
+                            ignored -> {
+                                LOG.info(
+                                        "Created Paimon snapshot metadata cache for table {}, maxEntries {}.",
+                                        tablePath,
+                                        snapshotMaxEntries);
+                                return Caffeine.newBuilder()
+                                        .softValues()
+                                        .maximumSize(snapshotMaxEntries)
+                                        .executor(Runnable::run)
+                                        .build();
+                            });
+            fileStoreTable.setSnapshotCache(snapshotCache);
+        }
+    }
+
+    private MemorySize getPaimonMemorySize(String key, String defaultValue) {
+        return MemorySize.parse(getPaimonConfig(key, defaultValue));
+    }
+
+    private int getPositiveInt(String key, int defaultValue) {
+        String value = getPaimonConfig(key, String.valueOf(defaultValue));
+        int parsed = Integer.parseInt(value);
+        if (parsed < 0) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Configuration '%s' must be non-negative, but was %s.", key, value));
+        }
+        return parsed;
+    }
+
+    private String getPaimonConfig(String key, String defaultValue) {
+        return paimonConfig.toMap().getOrDefault(key, defaultValue);
     }
 
     private static FileStoreTable getTable(Catalog catalog, TablePath tablePath) throws Exception {

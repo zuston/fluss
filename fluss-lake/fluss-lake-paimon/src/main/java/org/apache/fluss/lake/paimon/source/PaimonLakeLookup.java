@@ -45,6 +45,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimonLiteral;
@@ -53,6 +54,10 @@ import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimonLiter
 public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
 
     private static final Logger LOG = LoggerFactory.getLogger(PaimonLakeLookup.class);
+    private static final String LOOKUP_CACHE_FILE_RETENTION = "lookup.cache-file-retention";
+    private static final String LOOKUP_CACHE_FILE_RETENTION_VALUE = "1 h";
+    private static final String LOOKUP_CACHE_MAX_DISK_SIZE = "lookup.cache-max-disk-size";
+    private static final String LOOKUP_CACHE_MAX_DISK_SIZE_VALUE = "20 gb";
 
     private final LocalTableQuery tableQuery;
     private final IOManager ioManager;
@@ -64,18 +69,17 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
             new HashMap<>();
 
     public PaimonLakeLookup(FileStoreTable fileStoreTable, @Nullable int[][] project) {
-        this(fileStoreTable, project, null);
+        this(fileStoreTable, project, new String[0]);
     }
 
     public PaimonLakeLookup(
-            FileStoreTable fileStoreTable,
-            @Nullable int[][] project,
-            @Nullable String ioManagerTmpDir) {
+            FileStoreTable fileStoreTable, @Nullable int[][] project, String[] ioManagerTmpDirs) {
+        fileStoreTable = withLookupCacheOptions(fileStoreTable);
         if (fileStoreTable.primaryKeys().isEmpty()) {
             throw new UnsupportedOperationException(
                     "Paimon lake lookup only supports primary-key tables.");
         }
-        this.ioManager = createIOManager(ioManagerTmpDir);
+        this.ioManager = createIOManager(ioManagerTmpDirs);
         this.paimonRowType = fileStoreTable.rowType();
         this.partitionSerializer =
                 new InternalRowSerializer(fileStoreTable.schema().logicalPartitionType());
@@ -86,6 +90,19 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
             int[] projectIds = Arrays.stream(project).mapToInt(nested -> nested[0]).toArray();
             tableQuery.withValueProjection(projectIds);
         }
+    }
+
+    private static FileStoreTable withLookupCacheOptions(FileStoreTable fileStoreTable) {
+        Map<String, String> options = new HashMap<>(fileStoreTable.options());
+        options.put(LOOKUP_CACHE_FILE_RETENTION, LOOKUP_CACHE_FILE_RETENTION_VALUE);
+        options.put(LOOKUP_CACHE_MAX_DISK_SIZE, LOOKUP_CACHE_MAX_DISK_SIZE_VALUE);
+        LOG.info(
+                "Using Paimon lookup cache options: {}={}, {}={}.",
+                LOOKUP_CACHE_FILE_RETENTION,
+                LOOKUP_CACHE_FILE_RETENTION_VALUE,
+                LOOKUP_CACHE_MAX_DISK_SIZE,
+                LOOKUP_CACHE_MAX_DISK_SIZE_VALUE);
+        return fileStoreTable.copy(options);
     }
 
     @Override
@@ -208,12 +225,39 @@ public class PaimonLakeLookup implements LakeLookup<PaimonSplit> {
         }
     }
 
-    private static IOManager createIOManager(@Nullable String ioManagerTmpDir) {
-        String rootDir =
-                ioManagerTmpDir == null ? System.getProperty("java.io.tmpdir") : ioManagerTmpDir;
-        File tempDir = new File(rootDir, "fluss-paimon-lookup-" + UUID.randomUUID());
-        LOG.info("Creating Paimon lookup IO manager under {}.", tempDir.getAbsolutePath());
-        return IOManager.create(tempDir.getAbsolutePath());
+    private static IOManager createIOManager(String[] ioManagerTmpDirs) {
+        String[] rootDirs =
+                ioManagerTmpDirs.length == 0 ? resolveYarnLocalDirs() : ioManagerTmpDirs;
+        String lookupDirName = "fluss-paimon-lookup-" + UUID.randomUUID();
+        String[] tempDirs = new String[rootDirs.length];
+        for (int i = 0; i < rootDirs.length; i++) {
+            tempDirs[i] = new File(rootDirs[i], lookupDirName).getAbsolutePath();
+        }
+        LOG.info("Creating Paimon lookup IO manager under {}.", Arrays.toString(tempDirs));
+        return IOManager.create(tempDirs);
+    }
+
+    private static String[] resolveYarnLocalDirs() {
+        String localDirs = System.getenv("LOCAL_DIRS");
+        if (localDirs == null || localDirs.trim().isEmpty()) {
+            throw new IllegalStateException(
+                    "YARN LOCAL_DIRS environment variable is required for Paimon lookup IO temporary directories.");
+        }
+        String[] resolvedTmpDirs =
+                Arrays.stream(localDirs.split(",|" + Pattern.quote(File.pathSeparator)))
+                        .map(String::trim)
+                        .filter(localDir -> !localDir.isEmpty())
+                        .map(localDir -> new File(localDir, "fluss").getAbsolutePath())
+                        .toArray(String[]::new);
+        if (resolvedTmpDirs.length == 0) {
+            throw new IllegalStateException(
+                    "YARN LOCAL_DIRS environment variable is empty after parsing for Paimon lookup IO temporary directories.");
+        }
+        LOG.info(
+                "Resolved Paimon lookup IO root dirs {} from YARN LOCAL_DIRS={}.",
+                Arrays.toString(resolvedTmpDirs),
+                localDirs);
+        return resolvedTmpDirs;
     }
 
     @Override

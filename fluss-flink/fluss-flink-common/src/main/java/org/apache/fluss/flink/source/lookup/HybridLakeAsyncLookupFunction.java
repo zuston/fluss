@@ -28,24 +28,26 @@ import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.InvalidMetadataException;
 import org.apache.fluss.exception.LakeTableSnapshotNotExistException;
 import org.apache.fluss.flink.row.FlinkAsFlussRow;
 import org.apache.fluss.flink.utils.FlinkConversions;
 import org.apache.fluss.flink.utils.FlinkUtils;
 import org.apache.fluss.flink.utils.FlussRowToFlinkRowConverter;
-import org.apache.fluss.lake.source.LakeLookup;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.lake.source.Planner;
-import org.apache.fluss.lake.source.SupportsLakeLookup;
+import org.apache.fluss.lake.source.RecordReader;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.predicate.PredicateBuilder;
+import org.apache.fluss.record.LogRecord;
 import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.row.ProjectedRow;
 import org.apache.fluss.types.DataTypeRoot;
+import org.apache.fluss.utils.CloseableIterator;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.PartitionUtils;
 import org.apache.fluss.utils.concurrent.ExecutorThreadFactory;
@@ -65,6 +67,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
+import java.io.FileNotFoundException;
 import java.lang.reflect.Method;
 import java.time.Duration;
 import java.time.ZoneId;
@@ -100,6 +103,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private static final long serialVersionUID = 1L;
     private static final long LOOKUP_WINDOW_STATS_INTERVAL_MS = TimeUnit.MINUTES.toMillis(5);
     private static final int LOOKUP_WINDOW_LATENCY_SAMPLE_SIZE = 8192;
+    private static final long READABLE_LAKE_SNAPSHOT_CACHE_TTL_MS = TimeUnit.MINUTES.toMillis(1);
 
     private final Configuration flussConfig;
     private final TablePath tablePath;
@@ -116,7 +120,6 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private final Duration lakeFallbackTimeout;
     private final int lakeFallbackExecutorThreads;
     private final int lakeFallbackMaxConcurrency;
-    @Nullable private final String lakeLookupIoTmpDir;
 
     private transient FlussRowToFlinkRowConverter flussRowToFlinkRowConverter;
     private transient Connection connection;
@@ -127,13 +130,13 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
     private transient InternalRow.FieldGetter[] primaryKeyFieldGetters;
     private transient int autoPartitionKeyPositionInPrimaryKey;
     private transient org.apache.fluss.types.RowType flussFullRowType;
-    private transient List<LakeLookupHandle> lakeLookupHandles;
-    private transient ThreadLocal<LakeLookupHandle> lakeLookupThreadLocal;
     private transient ThreadPoolExecutor lakeLookupExecutor;
     private transient ScheduledExecutorService timeoutExecutor;
     private transient ScheduledExecutorService windowStatsExecutor;
     private transient AtomicInteger lakeFallbackPendingCount;
     private transient PeriodicLookupStats periodicLookupStats;
+    private transient Object readableLakeSnapshotCacheLock;
+    @Nullable private transient CachedLakeSnapshot readableLakeSnapshotCache;
     private transient volatile boolean closed;
     private transient Counter lookupHotFlussHitsTotal;
     private transient Counter lookupHotFlussMissesTotal;
@@ -160,8 +163,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
             ZoneId lookupTimeZone,
             Duration lakeFallbackTimeout,
             int lakeFallbackExecutorThreads,
-            int lakeFallbackMaxConcurrency,
-            @Nullable String lakeLookupIoTmpDir) {
+            int lakeFallbackMaxConcurrency) {
         this.flussConfig = flussConfig;
         this.tablePath = tablePath;
         this.flinkRowType = flinkRowType;
@@ -178,7 +180,6 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         this.lakeFallbackTimeout = lakeFallbackTimeout;
         this.lakeFallbackExecutorThreads = lakeFallbackExecutorThreads;
         this.lakeFallbackMaxConcurrency = lakeFallbackMaxConcurrency;
-        this.lakeLookupIoTmpDir = lakeLookupIoTmpDir;
     }
 
     @Override
@@ -201,8 +202,6 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         }
         flussRowToFlinkRowConverter =
                 new FlussRowToFlinkRowConverter(FlinkConversions.toFlussRowType(outputRowType));
-        lakeLookupHandles = Collections.synchronizedList(new ArrayList<>());
-        lakeLookupThreadLocal = ThreadLocal.withInitial(this::createLakeLookupHandle);
 
         Lookup lookup = table.newLookup();
         lookuper = lookup.createLookuper();
@@ -230,6 +229,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                         1, new ExecutorThreadFactory("fluss-lake-fallback-timeout"));
         lakeFallbackPendingCount = new AtomicInteger();
         periodicLookupStats = new PeriodicLookupStats();
+        readableLakeSnapshotCacheLock = new Object();
         registerMetrics(context);
         windowStatsExecutor =
                 new ScheduledThreadPoolExecutor(
@@ -260,6 +260,18 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                             } else if (throwable != null) {
                                 periodicLookupStats.recordFlussFailure(
                                         elapsedMillis(flussLookupStartMs));
+                                if (shouldFallbackToLakeOnFlussFailure(throwable, lookupKey)) {
+                                    lookupColdFlussMissesTotal.inc();
+                                    LOG.warn(
+                                            "Fluss async lookup failed with invalid metadata for cold partition in table {}, partition {}, primary key indexes {}, primary key values {}. Falling back to lake lookup.",
+                                            tablePath,
+                                            lookupKey.partitionValue,
+                                            Arrays.toString(primaryKeyIndexes),
+                                            Arrays.toString(lookupKey.primaryKeyValues),
+                                            throwable);
+                                    lookupLakeAsync(lookupKey, remainingFilter, future);
+                                    return;
+                                }
                                 LOG.error(
                                         "Fluss async lookup failed for table {}.",
                                         tablePath,
@@ -290,6 +302,23 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                             }
                         });
         return future;
+    }
+
+    private boolean shouldFallbackToLakeOnFlussFailure(
+            Throwable throwable, FlussLookupKey lookupKey) {
+        if (!ExceptionUtils.findThrowable(throwable, InvalidMetadataException.class).isPresent()) {
+            return false;
+        }
+        try {
+            return isColdPartition(lookupKey.partitionValue);
+        } catch (RuntimeException e) {
+            LOG.warn(
+                    "Cannot determine whether Fluss lookup failure for table {}, partition {} can fall back to lake lookup.",
+                    tablePath,
+                    lookupKey.partitionValue,
+                    e);
+            return false;
+        }
     }
 
     private void lookupLakeAsync(
@@ -417,7 +446,7 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         LakeSnapshot lakeSnapshot;
         long stageStartMs = System.currentTimeMillis();
         try {
-            lakeSnapshot = admin.getReadableLakeSnapshot(tablePath).get();
+            lakeSnapshot = getCachedReadableLakeSnapshot();
         } catch (Exception e) {
             Throwable stripped = ExceptionUtils.stripExecutionException(e);
             if (stripped instanceof LakeTableSnapshotNotExistException) {
@@ -436,6 +465,9 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     checkNotNull(
                             createLakeSource(tablePath, tableOptions),
                             "Lake source must not be null for lake fallback lookup.");
+            if (projection != null) {
+                lakeSource.withProject(toNestedProjection(projection));
+            }
             Predicate predicate = createPrimaryKeyPredicate(lookupKey.primaryKeyValues);
             LakeSource.FilterPushDownResult pushDownResult =
                     lakeSource.withFilters(Collections.singletonList(predicate));
@@ -450,7 +482,6 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
 
         stageStartMs = System.currentTimeMillis();
         List<LakeSplit> splits;
-        LakeLookupHandle lakeLookupHandle;
         try {
             Planner<LakeSplit> planner = lakeSource.createPlanner(lakeSnapshot::getSnapshotId);
             LOG.debug(
@@ -460,80 +491,61 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     Arrays.toString(primaryKeyIndexes),
                     Arrays.toString(lookupKey.primaryKeyValues));
             splits = planner.plan();
-            lakeLookupHandle = lakeLookupThreadLocal.get();
         } finally {
             periodicLookupStats.recordLakeStageLatency(
                     LakeLookupStage.PLAN, elapsedMillis(stageStartMs));
         }
 
-        stageStartMs = System.currentTimeMillis();
-        synchronized (lakeLookupHandle.lock) {
-            periodicLookupStats.recordLakeStageLatency(
-                    LakeLookupStage.LOCK_WAIT, elapsedMillis(stageStartMs));
-            if (closed) {
-                return Collections.emptyList();
-            }
-            LOG.debug(
-                    "Refreshing lake lookup for table {}, snapshot {}, split count {}.",
-                    tablePath,
-                    lakeSnapshot.getSnapshotId(),
-                    splits.size());
-            stageStartMs = System.currentTimeMillis();
-            try {
-                lakeLookupHandle.lookup.refresh(splits);
-            } finally {
-                periodicLookupStats.recordLakeStageLatency(
-                        LakeLookupStage.REFRESH, elapsedMillis(stageStartMs));
-            }
-            long splitLookupStartMs = System.currentTimeMillis();
-            boolean splitLookupRecorded = false;
-            LakeLookupFileStats fileStats = new LakeLookupFileStats(splits.size());
-            try {
-                for (LakeSplit split : splits) {
-                    if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
-                        continue;
-                    }
-                    fileStats.recordMatchedSplit(split);
-                    LOG.debug(
-                            "Calling lake lookup for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
-                            tablePath,
-                            lakeSnapshot.getSnapshotId(),
-                            split.partition(),
-                            split.bucket(),
-                            Arrays.toString(primaryKeyIndexes),
-                            Arrays.toString(lookupKey.primaryKeyValues));
-                    InternalRow row =
-                            lakeLookupHandle.lookup.lookup(
-                                    split.partition(),
-                                    split.bucket(),
-                                    lookupKey.primaryKeyValues,
-                                    primaryKeyIndexes);
-                    if (row == null) {
-                        continue;
-                    }
-                    periodicLookupStats.recordLakeStageLatency(
-                            LakeLookupStage.SPLIT_LOOKUP, elapsedMillis(splitLookupStartMs));
-                    splitLookupRecorded = true;
-
-                    stageStartMs = System.currentTimeMillis();
-                    try {
-                        RowData flinkRow = flussRowToFlinkRowConverter.toFlinkRowData(row);
-                        if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
-                            return Collections.singletonList(flinkRow);
-                        }
-                    } finally {
+        if (closed) {
+            return Collections.emptyList();
+        }
+        long splitLookupStartMs = System.currentTimeMillis();
+        boolean splitLookupRecorded = false;
+        LakeLookupFileStats fileStats = new LakeLookupFileStats(splits.size());
+        try {
+            for (LakeSplit split : splits) {
+                if (!matchesLookupPartition(split, lookupKey.partitionValue)) {
+                    continue;
+                }
+                fileStats.recordMatchedSplit(split);
+                LOG.debug(
+                        "Reading lake split for table {}, snapshot {}, partition {}, bucket {}, primary key indexes {}, primary key values {}.",
+                        tablePath,
+                        lakeSnapshot.getSnapshotId(),
+                        split.partition(),
+                        split.bucket(),
+                        Arrays.toString(primaryKeyIndexes),
+                        Arrays.toString(lookupKey.primaryKeyValues));
+                RecordReader reader = lakeSource.createRecordReader(() -> split);
+                try (CloseableIterator<LogRecord> iterator = reader.read()) {
+                    while (iterator.hasNext()) {
                         periodicLookupStats.recordLakeStageLatency(
-                                LakeLookupStage.ROW_CONVERT_FILTER, elapsedMillis(stageStartMs));
+                                LakeLookupStage.SPLIT_LOOKUP, elapsedMillis(splitLookupStartMs));
+                        splitLookupRecorded = true;
+
+                        stageStartMs = System.currentTimeMillis();
+                        try {
+                            RowData flinkRow =
+                                    flussRowToFlinkRowConverter.toFlinkRowData(
+                                            iterator.next().getRow());
+                            if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
+                                return Collections.singletonList(flinkRow);
+                            }
+                        } finally {
+                            periodicLookupStats.recordLakeStageLatency(
+                                    LakeLookupStage.ROW_CONVERT_FILTER,
+                                    elapsedMillis(stageStartMs));
+                        }
+                        splitLookupStartMs = System.currentTimeMillis();
+                        splitLookupRecorded = false;
                     }
-                    splitLookupStartMs = System.currentTimeMillis();
-                    splitLookupRecorded = false;
                 }
-            } finally {
-                periodicLookupStats.recordLakeFileStats(fileStats);
-                if (!splitLookupRecorded) {
-                    periodicLookupStats.recordLakeStageLatency(
-                            LakeLookupStage.SPLIT_LOOKUP, elapsedMillis(splitLookupStartMs));
-                }
+            }
+        } finally {
+            periodicLookupStats.recordLakeFileStats(fileStats);
+            if (!splitLookupRecorded) {
+                periodicLookupStats.recordLakeStageLatency(
+                        LakeLookupStage.SPLIT_LOOKUP, elapsedMillis(splitLookupStartMs));
             }
         }
         return Collections.emptyList();
@@ -588,39 +600,71 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         return split.partition().isEmpty() || split.partition().contains(partitionValue);
     }
 
-    private LakeLookupHandle createLakeLookupHandle() {
-        LakeLookupHandle lakeLookupHandle = new LakeLookupHandle(createLakeLookup());
-        int lookupIndex;
-        synchronized (lakeLookupHandles) {
-            lakeLookupHandles.add(lakeLookupHandle);
-            lookupIndex = lakeLookupHandles.size();
+    private LakeSnapshot getCachedReadableLakeSnapshot() throws Exception {
+        long nowMs = System.currentTimeMillis();
+        CachedLakeSnapshot cached = readableLakeSnapshotCache;
+        if (cached != null && cached.isValid(nowMs)) {
+            return cached.snapshot;
         }
-        LOG.info(
-                "Created lake fallback lookup instance {}/{} for table {}.",
-                lookupIndex,
-                lakeFallbackExecutorThreads,
-                tablePath);
-        return lakeLookupHandle;
+
+        synchronized (readableLakeSnapshotCacheLock) {
+            nowMs = System.currentTimeMillis();
+            cached = readableLakeSnapshotCache;
+            if (cached != null && cached.isValid(nowMs)) {
+                return cached.snapshot;
+            }
+
+            LakeSnapshot lakeSnapshot = getReadableLakeSnapshotWithRetry();
+            readableLakeSnapshotCache =
+                    new CachedLakeSnapshot(
+                            lakeSnapshot, nowMs + READABLE_LAKE_SNAPSHOT_CACHE_TTL_MS);
+            LOG.debug(
+                    "Refreshed readable lake snapshot cache for table {}, snapshot {}, ttlMs {}.",
+                    tablePath,
+                    lakeSnapshot.getSnapshotId(),
+                    READABLE_LAKE_SNAPSHOT_CACHE_TTL_MS);
+            return lakeSnapshot;
+        }
     }
 
-    @SuppressWarnings("unchecked")
-    private LakeLookup<LakeSplit> createLakeLookup() {
-        LakeSource<LakeSplit> lakeSource =
-                checkNotNull(
-                        createLakeSource(tablePath, tableOptions),
-                        "Lake source must not be null for lake fallback lookup.");
-        if (projection != null) {
-            lakeSource.withProject(toNestedProjection(projection));
-        }
-        if (!(lakeSource instanceof SupportsLakeLookup)) {
-            throw new TableException(
-                    "Lake fallback lookup requires the lake source to support primary-key lookup.");
-        }
+    private LakeSnapshot getReadableLakeSnapshotWithRetry() throws Exception {
         try {
-            return ((SupportsLakeLookup<LakeSplit>) lakeSource).createLookup(lakeLookupIoTmpDir);
-        } catch (Exception e) {
-            throw new TableException("Failed to create lake fallback lookup.", e);
+            return getReadableLakeSnapshot();
+        } catch (Exception firstException) {
+            if (!isMissingLakeSnapshotOffsetsFile(firstException)) {
+                throw firstException;
+            }
+            LOG.warn(
+                    "Failed to read readable lake snapshot offsets for table {}. Retrying once to reload latest readable snapshot from ZooKeeper.",
+                    tablePath,
+                    firstException);
+            try {
+                return getReadableLakeSnapshot();
+            } catch (Exception retryException) {
+                retryException.addSuppressed(firstException);
+                throw retryException;
+            }
         }
+    }
+
+    private LakeSnapshot getReadableLakeSnapshot() throws Exception {
+        return admin.getReadableLakeSnapshot(tablePath).get();
+    }
+
+    private boolean isMissingLakeSnapshotOffsetsFile(Throwable throwable) {
+        Throwable stripped = ExceptionUtils.stripExecutionException(throwable);
+        if (ExceptionUtils.findThrowable(stripped, FileNotFoundException.class).isPresent()) {
+            return true;
+        }
+        return ExceptionUtils.findThrowable(
+                        stripped,
+                        cause -> {
+                            String message = cause.getMessage();
+                            return message != null
+                                    && message.contains(FileNotFoundException.class.getName())
+                                    && message.contains(".offsets");
+                        })
+                .isPresent();
     }
 
     private Predicate createPrimaryKeyPredicate(Object[] primaryKeyValues) {
@@ -876,25 +920,6 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                 exception = e;
             }
         }
-        if (lakeLookupHandles != null) {
-            List<LakeLookupHandle> handles;
-            synchronized (lakeLookupHandles) {
-                handles = new ArrayList<>(lakeLookupHandles);
-            }
-            for (LakeLookupHandle handle : handles) {
-                try {
-                    synchronized (handle.lock) {
-                        handle.lookup.close();
-                    }
-                } catch (Exception e) {
-                    if (exception == null) {
-                        exception = e;
-                    } else {
-                        exception.addSuppressed(e);
-                    }
-                }
-            }
-        }
         if (connection != null) {
             try {
                 connection.close();
@@ -928,15 +953,6 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
                     executorName,
                     tablePath,
                     e);
-        }
-    }
-
-    private static class LakeLookupHandle {
-        private final LakeLookup<LakeSplit> lookup;
-        private final Object lock = new Object();
-
-        private LakeLookupHandle(LakeLookup<LakeSplit> lookup) {
-            this.lookup = lookup;
         }
     }
 
@@ -1081,13 +1097,25 @@ public class HybridLakeAsyncLookupFunction extends AsyncLookupFunction {
         REJECTED
     }
 
+    private static class CachedLakeSnapshot {
+        private final LakeSnapshot snapshot;
+        private final long expireAtMs;
+
+        private CachedLakeSnapshot(LakeSnapshot snapshot, long expireAtMs) {
+            this.snapshot = snapshot;
+            this.expireAtMs = expireAtMs;
+        }
+
+        private boolean isValid(long nowMs) {
+            return nowMs < expireAtMs;
+        }
+    }
+
     private enum LakeLookupStage {
         QUEUE("queue"),
         SNAPSHOT("snapshot"),
         SOURCE_FILTER("sourceFilter"),
         PLAN("plan"),
-        LOCK_WAIT("lockWait"),
-        REFRESH("refresh"),
         SPLIT_LOOKUP("splitLookup"),
         ROW_CONVERT_FILTER("rowConvertFilter");
 

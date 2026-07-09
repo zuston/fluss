@@ -169,7 +169,6 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_TIMEOUT),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_EXECUTOR_THREADS),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_MAX_CONCURRENCY),
-                FlinkConnectorOptionsUtils.getFlinkIoTmpDir(context.getConfiguration()),
                 cache,
                 partitionDiscoveryIntervalMs,
                 splitAssignmentBatchSize,
