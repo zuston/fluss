@@ -279,6 +279,8 @@ public final class LogManager extends TabletManagerBase {
      * @param logFormat the log format
      * @param tieredLogLocalSegments the number of segments to retain in local for tiered log
      * @param isChangelog whether the log is a changelog of primary key table
+     * @param remoteLogRecoveryEnabled whether changelog replicas can recover KV state from remote
+     *     log
      */
     public LogTablet getOrCreateLog(
             File dataDir,
@@ -286,7 +288,8 @@ public final class LogManager extends TabletManagerBase {
             TableBucket tableBucket,
             LogFormat logFormat,
             int tieredLogLocalSegments,
-            boolean isChangelog)
+            boolean isChangelog,
+            boolean remoteLogRecoveryEnabled)
             throws Exception {
         return inLock(
                 logCreationOrDeletionLock,
@@ -309,6 +312,7 @@ public final class LogManager extends TabletManagerBase {
                                     logFormat,
                                     tieredLogLocalSegments,
                                     isChangelog,
+                                    remoteLogRecoveryEnabled,
                                     clock,
                                     true);
                     currentLogs.put(tableBucket, logTablet);
@@ -320,6 +324,24 @@ public final class LogManager extends TabletManagerBase {
 
                     return logTablet;
                 });
+    }
+
+    public LogTablet getOrCreateLog(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            boolean isChangelog)
+            throws Exception {
+        return getOrCreateLog(
+                dataDir,
+                tablePath,
+                tableBucket,
+                logFormat,
+                tieredLogLocalSegments,
+                isChangelog,
+                false);
     }
 
     public Optional<LogTablet> getLog(TableBucket tableBucket) {
@@ -433,6 +455,7 @@ public final class LogManager extends TabletManagerBase {
                         tableInfo.getTableConfig().getLogFormat(),
                         tableInfo.getTableConfig().getTieredLogLocalSegments(),
                         tableInfo.hasPrimaryKey(),
+                        tableInfo.getTableConfig().isRemoteLogRecoveryEnabled(),
                         clock,
                         isCleanShutdown);
         logTablet.updateIsDataLakeEnabled(tableInfo.getTableConfig().isDataLakeEnabled());

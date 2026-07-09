@@ -21,6 +21,7 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.remote.RemoteLogFetchInfo;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
@@ -56,6 +57,7 @@ import java.util.stream.Stream;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_PHYSICAL_TABLE_PATH_PA_2024;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA;
+import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH_PK;
@@ -428,6 +430,28 @@ class RemoteLogManagerTest extends RemoteLogTestBase {
         //  although 4 segments has been updated to remote, should still retain 2 segments in local
         // since 2(by default) segments is configured to retain in local
         logTablet.updateMinRetainOffset(40L);
+        assertThat(logTablet.getSegments()).hasSize(2);
+    }
+
+    @Test
+    void testRemoteLogRecoveryCleanupLocalSegments() throws Exception {
+        long tableId = 201L;
+        TablePath tablePath = TablePath.of("test_db", "test_only_tail_wal_cleanup");
+        registerTableInZkClient(
+                tablePath,
+                DATA1_SCHEMA_PK,
+                tableId,
+                Collections.singletonList("a"),
+                Collections.singletonMap(
+                        ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED.key(), "true"));
+
+        TableBucket tb = new TableBucket(tableId, 0);
+        makeKvTableAsLeader(tb, tablePath, INITIAL_LEADER_EPOCH, false);
+        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
+
+        addMultiSegmentsToLogTablet(logTablet, 5);
+        logTablet.updateRemoteLogStartOffset(0L);
+        logTablet.updateRemoteLogEndOffset(40L);
         assertThat(logTablet.getSegments()).hasSize(2);
     }
 

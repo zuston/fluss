@@ -85,6 +85,11 @@ public class TableConfig {
         return config.getOptional(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED).orElse(false);
     }
 
+    /** Whether primary key table replicas can recover KV state from remote log. */
+    public boolean isRemoteLogRecoveryEnabled() {
+        return config.get(ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED);
+    }
+
     /** Gets the log TTL of the table. */
     public long getLogTTLMs() {
         return config.get(ConfigOptions.TABLE_LOG_TTL).toMillis();

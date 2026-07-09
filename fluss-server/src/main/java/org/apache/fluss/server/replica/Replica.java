@@ -684,6 +684,21 @@ public final class Replica {
                 tieredLogLocalSegments);
     }
 
+    public void updateRemoteLogRecoveryEnabled(boolean remoteLogRecoveryEnabled) {
+        boolean oldValue = logTablet.isRemoteLogRecoveryEnabled();
+        if (oldValue == remoteLogRecoveryEnabled) {
+            return;
+        }
+
+        logTablet.updateRemoteLogRecoveryEnabled(remoteLogRecoveryEnabled);
+
+        LOG.info(
+                "Replica for {} remoteLogRecoveryEnabled changed from {} to {}",
+                tableBucket,
+                oldValue,
+                remoteLogRecoveryEnabled);
+    }
+
     private void createKv() {
         try {
             // create a closeable registry for the closable related to kv
@@ -2163,7 +2178,8 @@ public final class Replica {
                         tableBucket,
                         tableConfig.getLogFormat(),
                         tableConfig.getTieredLogLocalSegments(),
-                        isKvTable());
+                        isKvTable(),
+                        tableConfig.isRemoteLogRecoveryEnabled());
         // update high watermark.
         Optional<Long> watermarkOpt = lazyHighWatermarkCheckpoint.fetch(tableBucket);
         long watermark =

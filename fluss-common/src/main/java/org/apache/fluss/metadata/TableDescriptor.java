@@ -294,6 +294,18 @@ public final class TableDescriptor implements Serializable {
     }
 
     /**
+     * Returns a new TableDescriptor instance that is a copy of this TableDescriptor with remote log
+     * recovery enabled.
+     */
+    public TableDescriptor withRemoteLogRecoveryEnabled(boolean remoteLogRecoveryEnabled) {
+        Map<String, String> newProperties = new HashMap<>(properties);
+        newProperties.put(
+                ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED.key(),
+                String.valueOf(remoteLogRecoveryEnabled));
+        return withProperties(newProperties);
+    }
+
+    /**
      * Returns a new TableDescriptor instance that is a copy of this TableDescriptor with a new
      * bucket count.
      */

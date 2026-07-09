@@ -1662,6 +1662,38 @@ class CoordinatorEventProcessorTest {
                                         null))
                 .isInstanceOf(InvalidAlterTableException.class)
                 .hasMessageContaining("can only be altered on primary key tables");
+
+        // ALTER: try to enable remote log recovery on a log table should fail
+        TablePropertyChanges.Builder enableRemoteLogRecoveryBuilder =
+                TablePropertyChanges.builder();
+        enableRemoteLogRecoveryBuilder.setTableProperty(
+                ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED.key(), "true");
+        assertThatThrownBy(
+                        () ->
+                                metadataManager.alterTableProperties(
+                                        t1,
+                                        Collections.emptyList(),
+                                        enableRemoteLogRecoveryBuilder.build(),
+                                        false,
+                                        null))
+                .isInstanceOf(InvalidAlterTableException.class)
+                .hasMessageContaining("can only be altered on primary key tables");
+
+        // ALTER: try to set remote log recovery to false on a log table should also fail
+        TablePropertyChanges.Builder disableRemoteLogRecoveryBuilder =
+                TablePropertyChanges.builder();
+        disableRemoteLogRecoveryBuilder.setTableProperty(
+                ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED.key(), "false");
+        assertThatThrownBy(
+                        () ->
+                                metadataManager.alterTableProperties(
+                                        t1,
+                                        Collections.emptyList(),
+                                        disableRemoteLogRecoveryBuilder.build(),
+                                        false,
+                                        null))
+                .isInstanceOf(InvalidAlterTableException.class)
+                .hasMessageContaining("can only be altered on primary key tables");
     }
 
     @Test

@@ -1573,6 +1573,17 @@ public class ConfigOptions {
                                     + "Tables created before this option was introduced are treated as disabled. "
                                     + "Can be dynamically enabled via ALTER TABLE.");
 
+    public static final ConfigOption<Boolean> TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED =
+            key("table.kv.remote-log-recovery.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether primary key table replicas can recover KV state by replaying "
+                                    + "WAL from remote log storage. When enabled, local changelog "
+                                    + "cleanup may remove older WAL already copied to remote log "
+                                    + "and retain only the local tail. This option doesn't change "
+                                    + "writer ack semantics.");
+
     public static final ConfigOption<Boolean> TABLE_AUTO_PARTITION_ENABLED =
             key("table.auto-partition.enabled")
                     .booleanType()

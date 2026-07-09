@@ -107,6 +107,7 @@ public final class LogTablet {
     private volatile int tieredLogLocalSegments;
     private final Clock clock;
     private final boolean isChangeLog;
+    private volatile boolean remoteLogRecoveryEnabled;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -143,6 +144,7 @@ public final class LogTablet {
             LogFormat logFormat,
             int tieredLogLocalSegments,
             boolean isChangelog,
+            boolean remoteLogRecoveryEnabled,
             Clock clock) {
         this.dataDir = dataDir;
         this.physicalPath = physicalPath;
@@ -170,6 +172,7 @@ public final class LogTablet {
 
         this.clock = clock;
         this.isChangeLog = isChangelog;
+        this.remoteLogRecoveryEnabled = remoteLogRecoveryEnabled;
         // Default value to 0L for changelog to avoid cleaning up any segments in case of not
         // updating this value in time. Default value to Long.MAX_VALUE for normal log table,
         // as we don't need to retain logs for kv recovery.
@@ -316,6 +319,37 @@ public final class LogTablet {
             Clock clock,
             boolean isCleanShutdown)
             throws Exception {
+        return create(
+                dataDir,
+                tablePath,
+                tabletDir,
+                conf,
+                serverMetricGroup,
+                recoveryPoint,
+                scheduler,
+                logFormat,
+                tieredLogLocalSegments,
+                isChangelog,
+                false,
+                clock,
+                isCleanShutdown);
+    }
+
+    public static LogTablet create(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            File tabletDir,
+            Configuration conf,
+            TabletServerMetricGroup serverMetricGroup,
+            long recoveryPoint,
+            Scheduler scheduler,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            boolean isChangelog,
+            boolean remoteLogRecoveryEnabled,
+            Clock clock,
+            boolean isCleanShutdown)
+            throws Exception {
         // create the log directory if it doesn't exist
         Files.createDirectories(tabletDir.toPath());
 
@@ -361,6 +395,7 @@ public final class LogTablet {
                 logFormat,
                 tieredLogLocalSegments,
                 isChangelog,
+                remoteLogRecoveryEnabled,
                 clock);
     }
 
@@ -583,6 +618,15 @@ public final class LogTablet {
         return tieredLogLocalSegments;
     }
 
+    public void updateRemoteLogRecoveryEnabled(boolean remoteLogRecoveryEnabled) {
+        this.remoteLogRecoveryEnabled = remoteLogRecoveryEnabled;
+        deleteSegmentsAlreadyExistsInRemote();
+    }
+
+    public boolean isRemoteLogRecoveryEnabled() {
+        return remoteLogRecoveryEnabled;
+    }
+
     public void updateLakeTableSnapshotId(long snapshotId) {
         if (snapshotId > this.lakeTableSnapshotId) {
             this.lakeTableSnapshotId = snapshotId;
@@ -657,8 +701,7 @@ public final class LogTablet {
         }
 
         try {
-            // shouldn't clean up segments that will be used by kv recovery.
-            long cleanupToOffset = Math.min(minRetainOffset, cleanUpToOffset);
+            long cleanupToOffset = Math.min(recoverableCleanupOffset(), cleanUpToOffset);
             deleteOldSegments(cleanupToOffset, SegmentDeletionReason.LOG_MOVE_TO_REMOTE);
         } catch (IOException e) {
             LOG.error(
@@ -668,6 +711,16 @@ public final class LogTablet {
                     e);
             // do not re-throw exception as it is not critical.
         }
+    }
+
+    private long recoverableCleanupOffset() {
+        if (isChangeLog
+                && remoteLogRecoveryEnabled
+                && remoteLogStartOffset <= minRetainOffset
+                && remoteLogEndOffset >= minRetainOffset) {
+            return remoteLogEndOffset;
+        }
+        return minRetainOffset;
     }
 
     /**

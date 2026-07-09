@@ -120,6 +120,7 @@ public class TableDescriptorValidation {
         // check individual options
         checkReplicationFactor(tableConf);
         checkLogFormat(tableConf, hasPrimaryKey);
+        checkRemoteLogRecovery(tableConf, hasPrimaryKey);
         checkArrowCompression(tableConf);
         checkMergeEngine(tableConf, hasPrimaryKey, schema);
         checkDeleteBehavior(tableConf, hasPrimaryKey);
@@ -191,6 +192,14 @@ public class TableDescriptorValidation {
                     String.format(
                             "'%s' can only be altered on primary key tables.",
                             ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED.key()));
+        }
+
+        if (tableKeysToChange.contains(ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED.key())
+                && !currentTable.hasPrimaryKey()) {
+            throw new InvalidAlterTableException(
+                    String.format(
+                            "'%s' can only be altered on primary key tables.",
+                            ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED.key()));
         }
 
         if (!currentConfig.getDataLakeFormat().isPresent()) {
@@ -454,6 +463,15 @@ public class TableDescriptorValidation {
                     String.format(
                             "'%s' must be greater than 0.",
                             ConfigOptions.TABLE_TIERED_LOG_LOCAL_SEGMENTS.key()));
+        }
+    }
+
+    private static void checkRemoteLogRecovery(Configuration tableConf, boolean hasPrimaryKey) {
+        if (tableConf.get(ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED) && !hasPrimaryKey) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' can only be enabled on primary key tables.",
+                            ConfigOptions.TABLE_KV_REMOTE_LOG_RECOVERY_ENABLED.key()));
         }
     }
 
