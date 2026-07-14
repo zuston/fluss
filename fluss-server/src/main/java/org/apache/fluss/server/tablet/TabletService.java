@@ -132,6 +132,7 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     private final ReplicaManager replicaManager;
     private final TabletServerMetadataCache metadataCache;
     private final TabletServerMetadataProvider metadataFunctionProvider;
+    private final ExecutorService replicaStateChangeExecutor;
 
     public TabletService(
             int serverId,
@@ -142,7 +143,8 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             MetadataManager metadataManager,
             @Nullable Authorizer authorizer,
             DynamicConfigManager dynamicConfigManager,
-            ExecutorService ioExecutor) {
+            ExecutorService ioExecutor,
+            ExecutorService replicaStateChangeExecutor) {
         super(
                 remoteFileSystem,
                 ServerType.TABLET_SERVER,
@@ -156,6 +158,7 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
         this.metadataCache = metadataCache;
         this.metadataFunctionProvider =
                 new TabletServerMetadataProvider(zkClient, metadataManager, metadataCache);
+        this.replicaStateChangeExecutor = replicaStateChangeExecutor;
     }
 
     @Override
@@ -325,12 +328,26 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     public CompletableFuture<NotifyLeaderAndIsrResponse> notifyLeaderAndIsr(
             NotifyLeaderAndIsrRequest notifyLeaderAndIsrRequest) {
         CompletableFuture<NotifyLeaderAndIsrResponse> response = new CompletableFuture<>();
+        int coordinatorEpoch = notifyLeaderAndIsrRequest.getCoordinatorEpoch();
         List<NotifyLeaderAndIsrData> notifyLeaderAndIsrRequestData =
                 getNotifyLeaderAndIsrRequestData(notifyLeaderAndIsrRequest);
-        replicaManager.becomeLeaderOrFollower(
-                notifyLeaderAndIsrRequest.getCoordinatorEpoch(),
-                notifyLeaderAndIsrRequestData,
-                result -> response.complete(makeNotifyLeaderAndIsrResponse(result)));
+        try {
+            replicaStateChangeExecutor.execute(
+                    () -> {
+                        try {
+                            replicaManager.becomeLeaderOrFollower(
+                                    coordinatorEpoch,
+                                    notifyLeaderAndIsrRequestData,
+                                    result ->
+                                            response.complete(
+                                                    makeNotifyLeaderAndIsrResponse(result)));
+                        } catch (Throwable t) {
+                            response.completeExceptionally(t);
+                        }
+                    });
+        } catch (Throwable t) {
+            response.completeExceptionally(t);
+        }
         return response;
     }
 
