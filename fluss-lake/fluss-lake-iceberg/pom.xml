@@ -30,6 +30,10 @@
     <artifactId>fluss-lake-iceberg</artifactId>
     <name>Fluss : Lake : Iceberg</name>
 
+    <properties>
+        <iceberg.version>1.10.1-qiyi-9</iceberg.version>
+    </properties>
+
     <packaging>jar</packaging>
     <dependencies>
         <dependency>

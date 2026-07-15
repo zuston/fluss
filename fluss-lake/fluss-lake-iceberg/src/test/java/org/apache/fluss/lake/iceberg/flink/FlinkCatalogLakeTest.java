@@ -41,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.apache.fluss.config.ConfigOptions.TABLE_DATALAKE_ENABLED;
+import static org.apache.fluss.flink.adapter.CatalogTableAdapter.toCatalogTable;
 import static org.apache.fluss.lake.iceberg.IcebergLakeCatalog.SYSTEM_COLUMNS;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -86,7 +87,7 @@ class FlinkCatalogLakeTest extends FlinkIcebergTieringTestBase {
                         Collections.emptyList(),
                         UniqueConstraint.primaryKey("PK_first", List.of("first")));
         CatalogTable origin =
-                CatalogTable.of(
+                toCatalogTable(
                         Schema.newBuilder().fromResolvedSchema(resolvedSchema).build(),
                         "test comment",
                         Collections.emptyList(),
