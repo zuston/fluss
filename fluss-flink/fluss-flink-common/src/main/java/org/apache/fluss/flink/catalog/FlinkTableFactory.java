@@ -50,7 +50,6 @@ import org.apache.flink.table.factories.DynamicTableSourceFactory;
 import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.types.logical.RowType;
 
-import java.time.Duration;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -147,9 +146,6 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                         .toMillis();
         int splitAssignmentBatchSize =
                 tableOptions.get(FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE);
-        Duration lookupHotWindow =
-                tableOptions.getOptional(FlinkConnectorOptions.LOOKUP_HOT_WINDOW).orElse(null);
-
         LeaseContext leaseContext = LeaseContext.fromConf(tableOptions);
         return new FlinkTableSource(
                 toFlussTablePath(context.getObjectIdentifier()),
@@ -164,8 +160,6 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_ASYNC),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_INSERT_IF_NOT_EXISTS),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_ENABLED),
-                lookupHotWindow,
-                tableOptions.get(FlinkConnectorOptions.LOOKUP_TIME_ZONE),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_TIMEOUT),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_EXECUTOR_THREADS),
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_MAX_CONCURRENCY),
@@ -249,8 +243,6 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                                 FlinkConnectorOptions.LOOKUP_ASYNC,
                                 FlinkConnectorOptions.LOOKUP_INSERT_IF_NOT_EXISTS,
                                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_ENABLED,
-                                FlinkConnectorOptions.LOOKUP_HOT_WINDOW,
-                                FlinkConnectorOptions.LOOKUP_TIME_ZONE,
                                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_TIMEOUT,
                                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_EXECUTOR_THREADS,
                                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_MAX_CONCURRENCY,

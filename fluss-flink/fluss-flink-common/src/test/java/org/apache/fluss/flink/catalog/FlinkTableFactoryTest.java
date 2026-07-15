@@ -23,7 +23,7 @@ import org.apache.fluss.flink.sink.FlinkTableSink;
 import org.apache.fluss.flink.source.FlinkTableSource;
 import org.apache.fluss.flink.source.lookup.FlinkAsyncLookupFunction;
 import org.apache.fluss.flink.source.lookup.FlinkLookupFunction;
-import org.apache.fluss.flink.source.lookup.HybridLakeAsyncLookupFunction;
+import org.apache.fluss.flink.source.lookup.hybrid.HybridLakeAsyncLookupFunction;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.table.api.DataTypes;
@@ -219,22 +219,6 @@ abstract class FlinkTableFactoryTest {
                 .hasMessageContaining(
                         "Option 'lookup.lake-fallback.enabled' requires 'lookup.async' to be true.");
 
-        Map<String, String> missingHotWindowProperties = getLakeFallbackOptions();
-        missingHotWindowProperties.remove(FlinkConnectorOptions.LOOKUP_HOT_WINDOW.key());
-        assertThatThrownBy(
-                        () ->
-                                ((FlinkTableSource)
-                                                createTableSource(
-                                                        schema,
-                                                        missingHotWindowProperties,
-                                                        Collections.singletonList("pt")))
-                                        .getLookupRuntimeProvider(
-                                                new LookupRuntimeProviderContext(
-                                                        new int[][] {{0}, {1}, {2}})))
-                .isInstanceOf(TableException.class)
-                .hasMessageContaining(
-                        "Option 'lookup.hot-window' must be configured when 'lookup.lake-fallback.enabled' is true.");
-
         Map<String, String> cacheProperties = getLakeFallbackOptions();
         cacheProperties.put("lookup.cache", "partial");
         cacheProperties.put(PARTIAL_CACHE_EXPIRE_AFTER_ACCESS.key(), "18000");
@@ -360,7 +344,6 @@ abstract class FlinkTableFactoryTest {
         options.put(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT.key(), "HOUR");
         options.put(FlinkConnectorOptions.LOOKUP_ASYNC.key(), "true");
         options.put(FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_ENABLED.key(), "true");
-        options.put(FlinkConnectorOptions.LOOKUP_HOT_WINDOW.key(), "12 h");
         return options;
     }
 

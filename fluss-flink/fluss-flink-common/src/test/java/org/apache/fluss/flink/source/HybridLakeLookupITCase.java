@@ -179,7 +179,6 @@ abstract class HybridLakeLookupITCase extends AbstractTestBase {
                                         + " 'bucket.key' = 'id',"
                                         + " 'lookup.async' = 'true',"
                                         + " 'lookup.lake-fallback.enabled' = 'true',"
-                                        + " 'lookup.hot-window' = '12 h',"
                                         + " 'table.datalake.enabled' = 'true',"
                                         + " 'table.datalake.format' = 'paimon',"
                                         + " 'table.auto-partition.enabled' = 'true',"

@@ -17,20 +17,8 @@
 
 package org.apache.fluss.flink.source.lookup;
 
-import org.apache.fluss.client.Connection;
-import org.apache.fluss.client.ConnectionFactory;
-import org.apache.fluss.client.lookup.Lookup;
-import org.apache.fluss.client.lookup.LookupType;
-import org.apache.fluss.client.lookup.Lookuper;
-import org.apache.fluss.client.table.Table;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.flink.row.FlinkAsFlussRow;
-import org.apache.fluss.flink.utils.FlinkConversions;
-import org.apache.fluss.flink.utils.FlinkUtils;
-import org.apache.fluss.flink.utils.FlussRowToFlinkRowConverter;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.ProjectedRow;
 
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.FunctionContext;
@@ -41,11 +29,7 @@ import org.slf4j.LoggerFactory;
 
 import javax.annotation.Nullable;
 
-import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.stream.IntStream;
 
 /** A flink lookup function for fluss. */
 public class FlinkLookupFunction extends LookupFunction {
@@ -60,12 +44,7 @@ public class FlinkLookupFunction extends LookupFunction {
     @Nullable private final int[] projection;
     private final boolean insertIfNotExists;
 
-    private transient FlussRowToFlinkRowConverter flussRowToFlinkRowConverter;
-    private transient Connection connection;
-    private transient Table table;
-    private transient Lookuper lookuper;
-    private transient FlinkAsFlussRow lookupRow;
-    @Nullable private transient ProjectedRow projectedRow;
+    private transient FlussAsyncLookupClient lookupClient;
 
     public FlinkLookupFunction(
             Configuration flussConfig,
@@ -85,38 +64,15 @@ public class FlinkLookupFunction extends LookupFunction {
     @Override
     public void open(FunctionContext context) {
         LOG.info("start open ...");
-        connection = ConnectionFactory.createConnection(flussConfig);
-        table = connection.getTable(tablePath);
-        lookupRow = new FlinkAsFlussRow();
-
-        final RowType outputRowType;
-        if (projection == null) {
-            outputRowType = flinkRowType;
-            // we force to do projection if no projection pushdown, in order to handle schema
-            // changes (ADD COLUMN LAST), this guarantees the input row of
-            // flussRowToFlinkRowConverter is in expected schema even new columns are added.
-            projectedRow =
-                    ProjectedRow.from(IntStream.range(0, flinkRowType.getFieldCount()).toArray());
-        } else {
-            outputRowType = FlinkUtils.projectRowType(flinkRowType, projection);
-            // reuse the projected row
-            projectedRow = ProjectedRow.from(projection);
-        }
-        // TODO: currently, we assume only ADD COLUMN LAST schema changes, so the projection
-        //  positions can still work even after such changes.
-        flussRowToFlinkRowConverter =
-                new FlussRowToFlinkRowConverter(FlinkConversions.toFlussRowType(outputRowType));
-
-        Lookup lookup = table.newLookup();
-        if (lookupNormalizer.getLookupType() == LookupType.PREFIX_LOOKUP) {
-            int[] lookupKeyIndexes = lookupNormalizer.getLookupKeyIndexes();
-            RowType lookupKeyRowType = FlinkUtils.projectRowType(flinkRowType, lookupKeyIndexes);
-            lookup = lookup.lookupBy(lookupKeyRowType.getFieldNames());
-        } else if (insertIfNotExists) {
-            lookup = lookup.enableInsertIfNotExists();
-        }
-        lookuper = lookup.createLookuper();
-
+        lookupClient =
+                new FlussAsyncLookupClient(
+                        flussConfig,
+                        tablePath,
+                        flinkRowType,
+                        lookupNormalizer,
+                        projection,
+                        insertIfNotExists);
+        lookupClient.open();
         LOG.info("end open.");
     }
 
@@ -128,50 +84,23 @@ public class FlinkLookupFunction extends LookupFunction {
      */
     @Override
     public Collection<RowData> lookup(RowData keyRow) {
-        RowData normalizedKeyRow = lookupNormalizer.normalizeLookupKey(keyRow);
-        LookupNormalizer.RemainingFilter remainingFilter =
-                lookupNormalizer.createRemainingFilter(keyRow);
-        // wrap flink row as fluss row to lookup, the flink row has already been in expected order.
-        InternalRow flussKeyRow = lookupRow.replace(normalizedKeyRow);
-
+        FlussAsyncLookupClient.LookupRequest lookupRequest = lookupClient.prepareLookup(keyRow);
         // the retry mechanism will be handled by the underlying LookupClient layer
         try {
-            List<InternalRow> lookupRows = lookuper.lookup(flussKeyRow).get().getRowList();
-            if (lookupRows.isEmpty()) {
-                return Collections.emptyList();
-            }
-            List<RowData> projectedRows = new ArrayList<>();
-            for (InternalRow row : lookupRows) {
-                if (row != null) {
-                    RowData flinkRow =
-                            flussRowToFlinkRowConverter.toFlinkRowData(maybeProject(row));
-                    if (remainingFilter == null || remainingFilter.isMatch(flinkRow)) {
-                        projectedRows.add(flinkRow);
-                    }
-                }
-            }
-            return projectedRows;
+            return lookupClient.toFlinkRows(
+                    lookupClient.lookup(lookupRequest.flussKeyRow()).get(),
+                    lookupRequest.remainingFilter());
         } catch (Exception e) {
             LOG.error("Fluss lookup error", e);
             throw new RuntimeException("Execution of Fluss lookup failed: " + e.getMessage(), e);
         }
     }
 
-    private InternalRow maybeProject(InternalRow row) {
-        if (projectedRow == null) {
-            return row;
-        }
-        return projectedRow.replaceRow(row);
-    }
-
     @Override
     public void close() throws Exception {
         LOG.info("start close ...");
-        if (table != null) {
-            table.close();
-        }
-        if (connection != null) {
-            connection.close();
+        if (lookupClient != null) {
+            lookupClient.close();
         }
         LOG.info("end close.");
     }

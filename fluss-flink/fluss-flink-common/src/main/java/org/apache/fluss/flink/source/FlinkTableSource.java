@@ -24,8 +24,8 @@ import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.source.deserializer.RowDataDeserializationSchema;
 import org.apache.fluss.flink.source.lookup.FlinkAsyncLookupFunction;
 import org.apache.fluss.flink.source.lookup.FlinkLookupFunction;
-import org.apache.fluss.flink.source.lookup.HybridLakeAsyncLookupFunction;
 import org.apache.fluss.flink.source.lookup.LookupNormalizer;
+import org.apache.fluss.flink.source.lookup.hybrid.HybridLakeAsyncLookupFunction;
 import org.apache.fluss.flink.source.reader.LeaseContext;
 import org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils;
 import org.apache.fluss.flink.utils.FlinkConversions;
@@ -84,7 +84,6 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.Nullable;
 
 import java.time.Duration;
-import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -131,8 +130,6 @@ public class FlinkTableSource
     private final boolean lookupAsync;
     private final boolean insertIfNotExists;
     private final boolean lakeFallbackEnabled;
-    @Nullable private final Duration lookupHotWindow;
-    private final ZoneId lookupTimeZone;
     private final Duration lakeFallbackTimeout;
     private final int lakeFallbackExecutorThreads;
     private final int lakeFallbackMaxConcurrency;
@@ -196,8 +193,6 @@ public class FlinkTableSource
                 lookupAsync,
                 insertIfNotExists,
                 false,
-                null,
-                FlinkConnectorOptions.LOOKUP_TIME_ZONE.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_TIMEOUT.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_EXECUTOR_THREADS.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_MAX_CONCURRENCY.defaultValue(),
@@ -221,8 +216,6 @@ public class FlinkTableSource
             boolean lookupAsync,
             boolean insertIfNotExists,
             boolean lakeFallbackEnabled,
-            @Nullable Duration lookupHotWindow,
-            String lookupTimeZone,
             Duration lakeFallbackTimeout,
             int lakeFallbackExecutorThreads,
             int lakeFallbackMaxConcurrency,
@@ -244,8 +237,6 @@ public class FlinkTableSource
                 lookupAsync,
                 insertIfNotExists,
                 lakeFallbackEnabled,
-                lookupHotWindow,
-                lookupTimeZone,
                 lakeFallbackTimeout,
                 lakeFallbackExecutorThreads,
                 lakeFallbackMaxConcurrency,
@@ -288,8 +279,6 @@ public class FlinkTableSource
                 lookupAsync,
                 insertIfNotExists,
                 false,
-                null,
-                FlinkConnectorOptions.LOOKUP_TIME_ZONE.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_TIMEOUT.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_EXECUTOR_THREADS.defaultValue(),
                 FlinkConnectorOptions.LOOKUP_LAKE_FALLBACK_MAX_CONCURRENCY.defaultValue(),
@@ -314,8 +303,6 @@ public class FlinkTableSource
             boolean lookupAsync,
             boolean insertIfNotExists,
             boolean lakeFallbackEnabled,
-            @Nullable Duration lookupHotWindow,
-            String lookupTimeZone,
             Duration lakeFallbackTimeout,
             int lakeFallbackExecutorThreads,
             int lakeFallbackMaxConcurrency,
@@ -339,8 +326,6 @@ public class FlinkTableSource
         this.lookupAsync = lookupAsync;
         this.insertIfNotExists = insertIfNotExists;
         this.lakeFallbackEnabled = lakeFallbackEnabled;
-        this.lookupHotWindow = lookupHotWindow;
-        this.lookupTimeZone = ZoneId.of(lookupTimeZone);
         this.lakeFallbackTimeout = lakeFallbackTimeout;
         this.lakeFallbackExecutorThreads = lakeFallbackExecutorThreads;
         this.lakeFallbackMaxConcurrency = lakeFallbackMaxConcurrency;
@@ -561,10 +546,6 @@ public class FlinkTableSource
                             lookupNormalizer,
                             projectedFields,
                             tableOptions,
-                            checkNotNull(
-                                    lookupHotWindow,
-                                    "lookupHotWindow must not be null when lake fallback is enabled."),
-                            lookupTimeZone,
                             lakeFallbackTimeout,
                             lakeFallbackExecutorThreads,
                             lakeFallbackMaxConcurrency);
@@ -614,10 +595,6 @@ public class FlinkTableSource
             throw new TableException(
                     "Option 'lookup.lake-fallback.enabled' cannot be used with lookup cache.");
         }
-        if (lookupHotWindow == null) {
-            throw new TableException(
-                    "Option 'lookup.hot-window' must be configured when 'lookup.lake-fallback.enabled' is true.");
-        }
         Configuration tableConfig = Configuration.fromMap(tableOptions);
         if (!tableConfig.get(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED)) {
             throw new TableException(
@@ -663,8 +640,6 @@ public class FlinkTableSource
                         lookupAsync,
                         insertIfNotExists,
                         lakeFallbackEnabled,
-                        lookupHotWindow,
-                        lookupTimeZone.getId(),
                         lakeFallbackTimeout,
                         lakeFallbackExecutorThreads,
                         lakeFallbackMaxConcurrency,

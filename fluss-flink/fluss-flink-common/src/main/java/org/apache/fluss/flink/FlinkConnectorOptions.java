@@ -122,20 +122,6 @@ public class FlinkConnectorOptions {
                     .withDescription(
                             "Whether to fall back to the lake table when asynchronous lookup misses in Fluss.");
 
-    public static final ConfigOption<Duration> LOOKUP_HOT_WINDOW =
-            ConfigOptions.key("lookup.hot-window")
-                    .durationType()
-                    .noDefaultValue()
-                    .withDescription(
-                            "The hot data window for lake fallback lookup. Lookup keys inside this window only query Fluss.");
-
-    public static final ConfigOption<String> LOOKUP_TIME_ZONE =
-            ConfigOptions.key("lookup.time-zone")
-                    .stringType()
-                    .defaultValue(java.time.ZoneId.systemDefault().getId())
-                    .withDescription(
-                            "The time zone used to interpret hour partition values for lake fallback lookup.");
-
     public static final ConfigOption<Duration> LOOKUP_LAKE_FALLBACK_TIMEOUT =
             ConfigOptions.key("lookup.lake-fallback.timeout")
                     .durationType()

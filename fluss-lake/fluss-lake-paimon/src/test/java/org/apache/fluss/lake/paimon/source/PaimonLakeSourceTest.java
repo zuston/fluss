@@ -18,10 +18,8 @@
 
 package org.apache.fluss.lake.paimon.source;
 
-import org.apache.fluss.lake.source.LakeLookup;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.RecordReader;
-import org.apache.fluss.lake.source.SupportsLakeLookup;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.FieldRef;
 import org.apache.fluss.predicate.FunctionVisitor;
@@ -203,30 +201,19 @@ class PaimonLakeSourceTest extends PaimonSourceTestBase {
         writeRows(tablePath);
 
         LakeSource<PaimonSplit> lakeSource = lakeStorage.createLakeSource(tablePath);
+        LakeSource.FilterPushDownResult filterPushDownResult =
+                lakeSource.withFilters(
+                        Collections.singletonList(
+                                new PredicateBuilder(RowType.of(new IntType(), new StringType()))
+                                        .equal(0, 2)));
+        assertThat(filterPushDownResult.remainingPredicates()).isEmpty();
         List<PaimonSplit> paimonSplits = lakeSource.createPlanner(() -> 1).plan();
 
-        try (LakeLookup<PaimonSplit> lookup =
-                ((SupportsLakeLookup<PaimonSplit>) lakeSource).createLookup()) {
-            lookup.refresh(paimonSplits);
-            PaimonSplit paimonSplit = paimonSplits.get(0);
-            org.apache.fluss.row.InternalRow row =
-                    lookup.lookup(
-                            paimonSplit.partition(),
-                            paimonSplit.bucket(),
-                            new Object[] {2},
-                            new int[] {0});
-
-            org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters =
-                    org.apache.fluss.row.InternalRow.createFieldGetters(
-                            RowType.of(new IntType(), new StringType()));
-            assertThat(
-                            convertToFlinkRow(
-                                            fieldGetters,
-                                            CloseableIterator.wrap(
-                                                    Collections.singleton(row).iterator()))
-                                    .toString())
-                    .isEqualTo("[+I[2, name2]]");
-        }
+        org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters =
+                org.apache.fluss.row.InternalRow.createFieldGetters(
+                        RowType.of(new IntType(), new StringType()));
+        assertThat(readRows(lakeSource, paimonSplits, fieldGetters).toString())
+                .isEqualTo("[+I[2, name2]]");
     }
 
     @Test
@@ -239,28 +226,29 @@ class PaimonLakeSourceTest extends PaimonSourceTestBase {
         lakeSource.withProject(new int[][] {new int[] {1}});
         List<PaimonSplit> paimonSplits = lakeSource.createPlanner(() -> 1).plan();
 
-        try (LakeLookup<PaimonSplit> lookup =
-                ((SupportsLakeLookup<PaimonSplit>) lakeSource).createLookup()) {
-            lookup.refresh(paimonSplits);
-            PaimonSplit paimonSplit = paimonSplits.get(0);
-            org.apache.fluss.row.InternalRow row =
-                    lookup.lookup(
-                            paimonSplit.partition(),
-                            paimonSplit.bucket(),
-                            new Object[] {3},
-                            new int[] {0});
+        org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters =
+                org.apache.fluss.row.InternalRow.createFieldGetters(RowType.of(new StringType()));
+        assertThat(readRows(lakeSource, paimonSplits, fieldGetters).toString())
+                .contains("+I[name3]");
+    }
 
-            org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters =
-                    org.apache.fluss.row.InternalRow.createFieldGetters(
-                            RowType.of(new StringType()));
-            assertThat(
-                            convertToFlinkRow(
-                                            fieldGetters,
-                                            CloseableIterator.wrap(
-                                                    Collections.singleton(row).iterator()))
-                                    .toString())
-                    .isEqualTo("[+I[name3]]");
+    private List<Row> readRows(
+            LakeSource<PaimonSplit> lakeSource,
+            List<PaimonSplit> paimonSplits,
+            org.apache.fluss.row.InternalRow.FieldGetter[] fieldGetters)
+            throws Exception {
+        List<Row> rows = new ArrayList<>();
+        for (PaimonSplit paimonSplit : paimonSplits) {
+            RecordReader recordReader = lakeSource.createRecordReader(() -> paimonSplit);
+            try (CloseableIterator<LogRecord> iterator = recordReader.read()) {
+                rows.addAll(
+                        convertToFlinkRow(
+                                fieldGetters,
+                                TransformingCloseableIterator.transform(
+                                        iterator, LogRecord::getRow)));
+            }
         }
+        return rows;
     }
 
     private void writeRows(TablePath tablePath) throws Exception {

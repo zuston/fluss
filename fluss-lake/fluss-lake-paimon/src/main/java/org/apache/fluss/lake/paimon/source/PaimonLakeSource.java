@@ -21,11 +21,9 @@ package org.apache.fluss.lake.paimon.source;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.lake.paimon.utils.FlussToPaimonPredicateConverter;
 import org.apache.fluss.lake.serializer.SimpleVersionedSerializer;
-import org.apache.fluss.lake.source.LakeLookup;
 import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.source.Planner;
 import org.apache.fluss.lake.source.RecordReader;
-import org.apache.fluss.lake.source.SupportsLakeLookup;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 
@@ -64,7 +62,7 @@ import static org.apache.fluss.utils.MapUtils.newConcurrentHashMap;
  * Paimon Lake format implementation of {@link org.apache.fluss.lake.source.LakeSource} for reading
  * paimon table.
  */
-public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLookup<PaimonSplit> {
+public class PaimonLakeSource implements LakeSource<PaimonSplit> {
     private static final long serialVersionUID = 1L;
     private static final Logger LOG = LoggerFactory.getLogger(PaimonLakeSource.class);
 
@@ -149,20 +147,6 @@ public class PaimonLakeSource implements LakeSource<PaimonSplit>, SupportsLakeLo
             }
         } catch (Exception e) {
             throw new IOException("Fail to create record reader.", e);
-        }
-    }
-
-    @Override
-    public LakeLookup<PaimonSplit> createLookup() throws IOException {
-        return createLookup(new String[0]);
-    }
-
-    @Override
-    public LakeLookup<PaimonSplit> createLookup(String[] ioTmpDirs) throws IOException {
-        try {
-            return new PaimonLakeLookup(getTable(), project, ioTmpDirs);
-        } catch (Exception e) {
-            throw new IOException("Fail to create lookup.", e);
         }
     }
 
