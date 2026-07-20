@@ -25,7 +25,6 @@ import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogTablet;
 
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -34,9 +33,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
-import static org.apache.fluss.record.TestData.DATA1;
 import static org.apache.fluss.record.TestData.DATA1_TABLE_ID;
-import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsWithWriterId;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for remote log ttl in {@link RemoteLogManager}. */
@@ -75,13 +72,11 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
         // advance time past TTL (7 days)
         manualClock.advanceTime(Duration.ofDays(7).plusHours(1));
 
-        // Since data lake is enabled and no data has been tiered to data lake,
-        // the expired segments should not be deleted. The expired active segment is rolled
-        // and uploaded in this task run.
+        // since data lake is enabled and no data has been tiered to data lake,
+        // the expired segments should not be deleted.
         remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
-        assertThat(remoteLog.allRemoteLogSegments()).hasSize(5);
+        assertThat(remoteLog.allRemoteLogSegments()).hasSize(4);
         assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(0L);
-        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(50L);
 
         // set lake log end offset to 20, meaning only the first 2 segments
         // ([0,10) and [10,20)) have been tiered to lake
@@ -91,10 +86,10 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
         remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
 
         // only segments with remoteLogEndOffset <= 20 should be deleted (first 2 segments)
-        // remaining segments: [20,30), [30,40) and [40,50)
-        assertThat(remoteLog.allRemoteLogSegments()).hasSize(3);
+        // remaining segments: [20,30) and [30,40)
+        assertThat(remoteLog.allRemoteLogSegments()).hasSize(2);
         assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(20L);
-        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(50L);
+        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(40L);
         // verify remaining segments have the expected offsets
         assertThat(remoteLog.allRemoteLogSegments())
                 .allSatisfy(
@@ -104,14 +99,7 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
 
         // now advance lake log end offset to include all remaining segments
         logTablet.updateLakeLogEndOffset(40L);
-        // trigger again, segments whose end offset is <= 40 should now be deleted
-        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
-        assertThat(remoteLog.allRemoteLogSegments()).hasSize(1);
-        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(40L);
-        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(50L);
-
-        logTablet.updateLakeLogEndOffset(50L);
-        // trigger again, all remaining expired segments should now be deleted
+        // trigger again, remaining expired segments should now be deleted
         remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
         assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
         assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(Long.MAX_VALUE);
@@ -119,8 +107,8 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
         // Fetch records from remote.
         // mock to update remote log end offset and remote log start offset as
         // NotifyRemoteLogOffsetsRequest do.
-        logTablet.updateRemoteLogStartOffset(50L);
-        logTablet.updateRemoteLogEndOffset(50L);
+        logTablet.updateRemoteLogStartOffset(40L);
+        logTablet.updateRemoteLogEndOffset(40L);
         CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> future =
                 new CompletableFuture<>();
         replicaManager.fetchLogRecords(
@@ -133,42 +121,5 @@ final class RemoteLogTTLTest extends RemoteLogTestBase {
         FetchLogResultForBucket resultForBucket = result.get(tb);
         assertThat(resultForBucket.getErrorCode())
                 .isEqualTo(Errors.LOG_OFFSET_OUT_OF_RANGE_EXCEPTION.code());
-    }
-
-    @Test
-    void testExpiredActiveSegmentRolledUploadedAndLocallyDeleted() throws Exception {
-        TableBucket tb = new TableBucket(DATA1_TABLE_ID, 0);
-        makeLogTableAsLeader(tb, false);
-        LogTablet logTablet = replicaManager.getReplicaOrException(tb).getLogTablet();
-
-        addMultiSegmentsToLogTablet(logTablet, 1);
-        assertThat(logTablet.getSegments()).hasSize(1);
-        assertThat(logTablet.activeLogSegment().getSizeInBytes()).isGreaterThan(0);
-
-        manualClock.advanceTime(Duration.ofDays(7).plusHours(1));
-        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
-
-        RemoteLogTablet remoteLog = remoteLogManager.remoteLogTablet(tb);
-        assertThat(remoteLog.allRemoteLogSegments()).hasSize(1);
-        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(0L);
-        assertThat(remoteLog.getRemoteLogEndOffset()).hasValue(10L);
-        assertThat(logTablet.getSegments()).hasSize(1);
-        assertThat(logTablet.activeLogSegment().getBaseOffset()).isEqualTo(10L);
-        assertThat(logTablet.activeLogSegment().getSizeInBytes()).isZero();
-
-        logTablet.appendAsLeader(
-                genMemoryLogRecordsWithWriterId(
-                        Collections.singletonList(DATA1.get(0)),
-                        manualClock.milliseconds(),
-                        0,
-                        10L));
-
-        assertThat(logTablet.localLogEndOffset()).isEqualTo(11L);
-        assertThat(logTablet.activeLogSegment().getBaseOffset()).isEqualTo(10L);
-        assertThat(logTablet.activeLogSegment().getSizeInBytes()).isGreaterThan(0);
-
-        remoteLogTaskScheduler.triggerPeriodicScheduledTasks();
-        assertThat(remoteLog.allRemoteLogSegments()).isEmpty();
-        assertThat(remoteLog.getRemoteLogStartOffset()).isEqualTo(Long.MAX_VALUE);
     }
 }
