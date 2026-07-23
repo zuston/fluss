@@ -23,6 +23,7 @@ import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.record.FileLogProjection;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
+import org.apache.fluss.rpc.protocol.FetchLogReadPreference;
 
 import javax.annotation.Nullable;
 
@@ -67,14 +68,39 @@ public final class FetchParams {
 
     private final int minFetchBytes;
     private final long maxWaitMs;
+    private final FetchLogReadPreference readPreference;
     // TODO: add more params like epoch etc.
 
     public FetchParams(int replicaId, int maxFetchBytes) {
-        this(replicaId, true, maxFetchBytes, DEFAULT_MIN_FETCH_BYTES, DEFAULT_MAX_WAIT_MS);
+        this(replicaId, maxFetchBytes, FetchLogReadPreference.LOCAL_FIRST);
+    }
+
+    public FetchParams(int replicaId, int maxFetchBytes, FetchLogReadPreference readPreference) {
+        this(
+                replicaId,
+                true,
+                maxFetchBytes,
+                DEFAULT_MIN_FETCH_BYTES,
+                DEFAULT_MAX_WAIT_MS,
+                readPreference);
     }
 
     public FetchParams(int replicaId, int maxFetchBytes, int minFetchBytes, long maxWaitMs) {
-        this(replicaId, true, maxFetchBytes, minFetchBytes, maxWaitMs);
+        this(
+                replicaId,
+                maxFetchBytes,
+                minFetchBytes,
+                maxWaitMs,
+                FetchLogReadPreference.LOCAL_FIRST);
+    }
+
+    public FetchParams(
+            int replicaId,
+            int maxFetchBytes,
+            int minFetchBytes,
+            long maxWaitMs,
+            FetchLogReadPreference readPreference) {
+        this(replicaId, true, maxFetchBytes, minFetchBytes, maxWaitMs, readPreference);
     }
 
     @VisibleForTesting
@@ -84,6 +110,23 @@ public final class FetchParams {
             int maxFetchBytes,
             int minFetchBytes,
             long maxWaitMs) {
+        this(
+                replicaId,
+                fetchOnlyLeader,
+                maxFetchBytes,
+                minFetchBytes,
+                maxWaitMs,
+                FetchLogReadPreference.LOCAL_FIRST);
+    }
+
+    @VisibleForTesting
+    public FetchParams(
+            int replicaId,
+            boolean fetchOnlyLeader,
+            int maxFetchBytes,
+            int minFetchBytes,
+            long maxWaitMs,
+            FetchLogReadPreference readPreference) {
         this.replicaId = replicaId;
         this.fetchOnlyLeader = fetchOnlyLeader;
         this.maxFetchBytes = maxFetchBytes;
@@ -92,6 +135,7 @@ public final class FetchParams {
         this.fetchOffset = -1;
         this.minFetchBytes = minFetchBytes;
         this.maxWaitMs = maxWaitMs;
+        this.readPreference = readPreference;
     }
 
     public void setCurrentFetch(
@@ -170,6 +214,14 @@ public final class FetchParams {
         return replicaId >= 0;
     }
 
+    public FetchLogReadPreference readPreference() {
+        return readPreference;
+    }
+
+    public boolean isRemoteFirstClientFetch() {
+        return !isFromFollower() && readPreference == FetchLogReadPreference.REMOTE_FIRST;
+    }
+
     public boolean fetchOnlyLeader() {
         return isFromFollower() || fetchOnlyLeader;
     }
@@ -190,12 +242,13 @@ public final class FetchParams {
         return replicaId == that.replicaId
                 && maxFetchBytes == that.maxFetchBytes
                 && minFetchBytes == that.minFetchBytes
-                && maxWaitMs == that.maxWaitMs;
+                && maxWaitMs == that.maxWaitMs
+                && readPreference == that.readPreference;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(replicaId, maxFetchBytes, minFetchBytes, maxWaitMs);
+        return Objects.hash(replicaId, maxFetchBytes, minFetchBytes, maxWaitMs, readPreference);
     }
 
     @Override
@@ -209,6 +262,8 @@ public final class FetchParams {
                 + minFetchBytes
                 + ", maxWaitMs="
                 + maxWaitMs
+                + ", readPreference="
+                + readPreference
                 + ')';
     }
 }

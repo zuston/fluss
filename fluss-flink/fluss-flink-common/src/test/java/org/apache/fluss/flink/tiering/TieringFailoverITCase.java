@@ -25,7 +25,6 @@ import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.types.DataTypes;
 
-import org.apache.flink.core.execution.JobClient;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -75,8 +74,7 @@ class TieringFailoverITCase extends FlinkTieringTestBase {
         TestingValuesLake.failWhen(t1.toString()).failWriteOnce();
 
         // then start tiering job
-        JobClient jobClient = buildTieringJob(execEnv);
-        try {
+        try (TieringJobScope ignored = startTieringJob(execEnv)) {
             // check the status of replica after synced
             assertReplicaStatus(t1Bucket, 3);
 
@@ -95,8 +93,6 @@ class TieringFailoverITCase extends FlinkTieringTestBase {
             assertReplicaStatus(t1Bucket, expectedRows.size());
 
             checkDataInValuesTable(t1, expectedRows);
-        } finally {
-            jobClient.cancel().get();
         }
     }
 
