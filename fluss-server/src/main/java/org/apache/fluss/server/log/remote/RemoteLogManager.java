@@ -314,6 +314,7 @@ public class RemoteLogManager implements Closeable {
                                     replica,
                                     remoteLog,
                                     remoteLogStorage,
+                                    remoteLogIndexCache(replica.getLogTablet().getDataDir()),
                                     coordinatorGateway,
                                     clock,
                                     maxUploadSegmentsPerTask);
