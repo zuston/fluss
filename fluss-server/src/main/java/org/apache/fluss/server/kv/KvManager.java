@@ -17,6 +17,7 @@
 
 package org.apache.fluss.server.kv;
 
+import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.compression.ArrowCompressionInfo;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
@@ -57,6 +58,7 @@ import org.rocksdb.RocksDB;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 import java.io.File;
@@ -140,6 +142,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     /** Current shared rate limiter configuration in bytes per second. */
     private volatile long currentSharedRateLimitBytesPerSec;
 
+    private final KvFlushScheduler kvFlushScheduler;
+
     private volatile boolean isShutdown = false;
 
     private KvManager(
@@ -148,7 +152,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             ZooKeeperClient zkClient,
             int recoveryThreadsPerDataDir,
             LogManager logManager,
-            TabletServerMetricGroup tabletServerMetricGroup)
+            TabletServerMetricGroup tabletServerMetricGroup,
+            @Nullable KvFlushScheduler kvFlushScheduler)
             throws IOException {
         super(TabletType.KV, localDiskManager.dataDirs(), conf, recoveryThreadsPerDataDir);
         this.localDiskManager = localDiskManager;
@@ -162,6 +167,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         this.sharedRocksDBRateLimiter = createSharedRateLimiter(conf);
         this.currentSharedRateLimitBytesPerSec =
                 conf.get(ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC).getBytes();
+        this.kvFlushScheduler =
+                kvFlushScheduler != null ? kvFlushScheduler : new KvFlushScheduler(conf);
     }
 
     private static RateLimiter createSharedRateLimiter(Configuration conf) {
@@ -189,13 +196,31 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             TabletServerMetricGroup tabletServerMetricGroup,
             LocalDiskManager localDiskManager)
             throws IOException {
+        return create(conf, zkClient, logManager, tabletServerMetricGroup, localDiskManager, null);
+    }
+
+    /**
+     * Creates a KvManager with a caller-provided flush scheduler ({@code null} means the manager
+     * creates its own). Only used by tests that need deterministic control over when the
+     * asynchronous KV flush runs.
+     */
+    @VisibleForTesting
+    public static KvManager create(
+            Configuration conf,
+            ZooKeeperClient zkClient,
+            LogManager logManager,
+            TabletServerMetricGroup tabletServerMetricGroup,
+            LocalDiskManager localDiskManager,
+            @Nullable KvFlushScheduler kvFlushScheduler)
+            throws IOException {
         return new KvManager(
                 localDiskManager,
                 conf,
                 zkClient,
                 conf.getInt(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS),
                 logManager,
-                tabletServerMetricGroup);
+                tabletServerMetricGroup,
+                kvFlushScheduler);
     }
 
     public void startup() {
@@ -205,6 +230,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
     public void shutdown() {
         LOG.info("Shutting down KvManager");
         isShutdown = true;
+        kvFlushScheduler.close();
         List<KvTablet> kvs = new ArrayList<>(currentKvs.values());
         for (KvTablet kvTablet : kvs) {
             try {
@@ -233,6 +259,7 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
      * @param tableBucket the table bucket
      * @param logTablet the cdc log tablet of the kv tablet
      * @param kvFormat the kv format
+     * @param flushCompleteListener invoked after each kv flush that made progress, nullable
      */
     public KvTablet getOrCreateKv(
             PhysicalTablePath tablePath,
@@ -241,7 +268,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
             KvFormat kvFormat,
             SchemaGetter schemaGetter,
             TableConfig tableConfig,
-            ArrowCompressionInfo arrowCompressionInfo)
+            ArrowCompressionInfo arrowCompressionInfo,
+            @Nullable Runnable flushCompleteListener)
             throws Exception {
         return inLock(
                 tabletCreationOrDeletionLock,
@@ -276,6 +304,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                                     schemaGetter,
                                     tableConfig.getChangelogImage(),
                                     sharedRocksDBRateLimiter,
+                                    kvFlushScheduler,
+                                    flushCompleteListener,
                                     autoIncrementManager);
                     currentKvs.put(tableBucket, tablet);
 
@@ -347,7 +377,9 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
         }
     }
 
-    public KvTablet loadKv(File tabletDir, SchemaGetter schemaGetter) throws Exception {
+    public KvTablet loadKv(
+            File tabletDir, SchemaGetter schemaGetter, @Nullable Runnable flushCompleteListener)
+            throws Exception {
         Tuple2<PhysicalTablePath, TableBucket> pathAndBucket = FlussPaths.parseTabletDir(tabletDir);
         PhysicalTablePath physicalTablePath = pathAndBucket.f0;
         TableBucket tableBucket = pathAndBucket.f1;
@@ -394,6 +426,8 @@ public final class KvManager extends TabletManagerBase implements ServerReconfig
                         schemaGetter,
                         tableConfig.getChangelogImage(),
                         sharedRocksDBRateLimiter,
+                        kvFlushScheduler,
+                        flushCompleteListener,
                         autoIncrementManager);
         if (this.currentKvs.containsKey(tableBucket)) {
             throw new IllegalStateException(

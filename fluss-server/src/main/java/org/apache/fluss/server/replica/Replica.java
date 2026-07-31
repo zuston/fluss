@@ -672,7 +672,27 @@ public final class Replica {
     private void mayFlushKv(long newHighWatermark) {
         KvTablet kvTablet = this.kvTablet;
         if (kvTablet != null) {
-            kvTablet.flush(newHighWatermark, fatalErrorHandler);
+            kvTablet.requestFlush(newHighWatermark, fatalErrorHandler);
+        }
+    }
+
+    private void onKvFlushComplete() {
+        boolean leaderHWIncremented =
+                inWriteLock(
+                        leaderIsrUpdateLock,
+                        () -> {
+                            if (!isLeader()) {
+                                return false;
+                            }
+                            try {
+                                return maybeIncrementLeaderHW(logTablet, clock.milliseconds());
+                            } catch (IOException e) {
+                                fatalErrorHandler.onFatalError(e);
+                                return false;
+                            }
+                        });
+        if (leaderHWIncremented) {
+            tryCompleteDelayedOperations();
         }
     }
 
@@ -721,7 +741,7 @@ public final class Replica {
                 downloadKvSnapshots(completedSnapshot, tabletDir.toPath());
 
                 // as we have downloaded kv files into the tablet dir, now, we can load it
-                kvTablet = kvManager.loadKv(tabletDir, schemaGetter);
+                kvTablet = kvManager.loadKv(tabletDir, schemaGetter, this::onKvFlushComplete);
 
                 checkNotNull(kvTablet, "kv tablet should not be null.");
                 restoreStartOffset = completedSnapshot.getLogOffset();
@@ -744,7 +764,8 @@ public final class Replica {
                                 tableConfig.getKvFormat(),
                                 schemaGetter,
                                 tableConfig,
-                                arrowCompressionInfo);
+                                arrowCompressionInfo,
+                                this::onKvFlushComplete);
 
                 // we don't support rowCount
                 rowCount = tableConfig.getChangelogImage() == ChangelogImage.WAL ? null : 0L;
@@ -772,9 +793,11 @@ public final class Replica {
                 tableBucket,
                 endTime - startTime);
 
-        // Register RocksDB statistics to BucketMetricGroup
-        if (kvTablet != null && kvTablet.getRocksDBStatistics() != null) {
-            bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
+        if (kvTablet != null) {
+            // Register RocksDB statistics now that the kv tablet is fully initialized.
+            if (kvTablet.getRocksDBStatistics() != null) {
+                bucketMetricGroup.registerRocksDBStatistics(kvTablet.getRocksDBStatistics());
+            }
         }
 
         return optCompletedSnapshot;
@@ -1005,6 +1028,27 @@ public final class Replica {
         return logTablet.appendAsFollower(memoryLogRecords);
     }
 
+    /**
+     * Samples the recent backpressure pressure for piggyback on a put response. Also records the
+     * value on this bucket's {@link BucketMetricGroup} for table-level aggregation.
+     */
+    public float samplePressure() {
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    if (!isLeader()) {
+                        return 0f;
+                    }
+                    KvTablet kv = this.kvTablet;
+                    if (kv == null) {
+                        return 0f;
+                    }
+                    float pressure = kv.currentPressure();
+                    bucketMetricGroup.recordKvBackpressureLevel(pressure);
+                    return pressure;
+                });
+    }
+
     public LogAppendInfo putRecordsToLeader(
             KvRecordBatch kvRecords,
             @Nullable int[] targetColumns,
@@ -1121,11 +1165,26 @@ public final class Replica {
             }
         }
 
-        // when the watermark can be advanced, we may need to flush kv first if it's kv replica,
-        // and then update highWatermark.
-        // TODO The flushKV and updateHighWatermark need to be atomic operation. See
-        // https://github.com/apache/fluss/issues/513
-        mayFlushKv(newHighWatermark.getMessageOffset());
+        KvTablet currentKv = this.kvTablet;
+        if (currentKv != null) {
+            long flushedOffset = currentKv.getFlushedLogOffset();
+            if (flushedOffset < newHighWatermark.getMessageOffset()) {
+                // The KV view must be flushed before the log high watermark becomes visible. Kick
+                // the asynchronous flush towards the full candidate (the flush runs on the shared
+                // KV flush scheduler so this RPC worker does not execute RocksDB writes), and
+                // clamp this advance to the already-flushed offset so completed flush work becomes
+                // visible immediately instead of waiting for the flush to catch up with an
+                // ever-newer candidate.
+                mayFlushKv(newHighWatermark.getMessageOffset());
+                if (flushedOffset <= leaderLog.getHighWatermark()) {
+                    return false;
+                }
+                // TODO: Under sustained writes, the KV high watermark may frequently advance with
+                // message-offset-only metadata. Materializing the missing segment metadata requires
+                // log-index and log-file I/O, adding overhead to the high-watermark hot path.
+                newHighWatermark = new LogOffsetMetadata(flushedOffset);
+            }
+        }
 
         Optional<LogOffsetMetadata> oldWatermark =
                 leaderLog.maybeIncrementHighWatermark(newHighWatermark);
@@ -1251,6 +1310,41 @@ public final class Replica {
                         checkNotNull(
                                 kvTablet, "KvTablet for the replica to get key shouldn't be null.");
                         return kvTablet.multiGet(keys);
+                    } catch (IOException e) {
+                        String errorMsg =
+                                String.format(
+                                        "Failed to lookup from local kv for table bucket %s, the cause is: %s",
+                                        tableBucket, e.getMessage());
+                        LOG.error(errorMsg, e);
+                        throw new KvStorageException(errorMsg, e);
+                    }
+                });
+    }
+
+    /**
+     * Lookups that also see entries still pending in the kv pre-write buffer. Only for internal
+     * reads that must observe their own just-written data (e.g. the re-lookup of
+     * lookup-with-insert-if-not-exists after an {@code acks = 1} insert, where the asynchronous
+     * flush may not have materialized the insert into RocksDB yet).
+     */
+    public List<byte[]> lookupsFromBufferOrKv(List<byte[]> keys) {
+        if (!isKvTable()) {
+            throw new NonPrimaryKeyTableException(
+                    "the primary key table not exists for " + tableBucket);
+        }
+        return inReadLock(
+                leaderIsrUpdateLock,
+                () -> {
+                    try {
+                        if (!isLeader()) {
+                            throw new NotLeaderOrFollowerException(
+                                    String.format(
+                                            "Leader not local for bucket %s on tabletServer %d",
+                                            tableBucket, localTabletServerId));
+                        }
+                        checkNotNull(
+                                kvTablet, "KvTablet for the replica to get key shouldn't be null.");
+                        return kvTablet.multiGetFromBufferOrKv(keys);
                     } catch (IOException e) {
                         String errorMsg =
                                 String.format(

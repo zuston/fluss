@@ -21,6 +21,7 @@ import org.apache.fluss.cluster.Endpoint;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.exception.InvalidCoordinatorException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
@@ -95,6 +96,7 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -153,6 +155,7 @@ import static org.apache.fluss.testutils.DataTestUtils.genKvRecords;
 import static org.apache.fluss.testutils.DataTestUtils.genMemoryLogRecordsByObject;
 import static org.apache.fluss.testutils.DataTestUtils.getKeyValuePairs;
 import static org.apache.fluss.testutils.DataTestUtils.row;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -162,6 +165,9 @@ class ReplicaManagerTest extends ReplicaTestBase {
     private static final short PUT_KV_VERSION = 1;
     private static final short LOOKUP_KV_VERSION = 1;
     private static final short PREFIX_LOOKUP_KV_VERSION = 1;
+
+    /** First PUT_KV version that understands the STORAGE_BACKPRESSURE_EXCEPTION error code. */
+    private static final short PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE = 2;
 
     @Test
     void testProduceLog() throws Exception {
@@ -546,6 +552,82 @@ class ReplicaManagerTest extends ReplicaTestBase {
     }
 
     @Test
+    void testPutKvAcksOneCompletesOnLocalAppendWithoutHighWatermark() throws Exception {
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID_PK, 1);
+        makeKvTableAsLeader(
+                tb,
+                DATA1_TABLE_PATH_PK,
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                Arrays.asList(TABLET_SERVER_ID, 2),
+                INITIAL_LEADER_EPOCH,
+                false);
+
+        CompletableFuture<List<PutKvResultForBucket>> future = new CompletableFuture<>();
+        replicaManager.putRecordsToKv(
+                20000,
+                1,
+                Collections.singletonMap(tb, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)),
+                null,
+                MergeMode.DEFAULT,
+                PUT_KV_VERSION,
+                future::complete);
+
+        // acks = 1 completes right after the local leader append: no delayed operation, no
+        // waiting for KV flush or high watermark advancement (the follower never fetches here).
+        assertThat(future.get(10, TimeUnit.SECONDS)).containsOnly(new PutKvResultForBucket(tb, 8));
+        Replica replica = replicaManager.getReplicaOrException(tb);
+        assertThat(replica.getLocalLogEndOffset()).isEqualTo(8L);
+        assertThat(replica.getLogHighWatermark()).isLessThan(8L);
+    }
+
+    @Test
+    void testStorageBackpressureErrorDowngradedForOldPutKvVersion() throws Exception {
+        // Mixed-version rolling-upgrade coverage for the STORAGE_BACKPRESSURE_EXCEPTION error
+        // code (72). Shrink the KV write buffer BEFORE creating the tablet so that a single
+        // oversized batch trips the write-path admission gate; conf is rebuilt per test in
+        // setup(), so this does not leak into other tests.
+        conf.set(ConfigOptions.KV_WRITE_BUFFER_SIZE, MemorySize.parse("1kb"));
+        TableBucket tb = new TableBucket(DATA1_TABLE_ID_PK, 1);
+        makeKvTableAsLeader(DATA1_TABLE_ID_PK, DATA1_TABLE_PATH_PK, tb.getBucket());
+
+        // Old client (v1): pre-upgrade clients map the unknown code 72 to the non-retriable
+        // UNKNOWN_SERVER_ERROR, so the server must downgrade the rejection to the retriable
+        // KV_STORAGE_EXCEPTION, keeping the original message for diagnosability.
+        PutKvResultForBucket oldClientResult = putOversizedBatch(tb, PUT_KV_VERSION);
+        assertThat(oldClientResult.failed()).isTrue();
+        assertThat(oldClientResult.getError().error()).isEqualTo(Errors.KV_STORAGE_EXCEPTION);
+        assertThat(oldClientResult.getError().message()).contains("Retry after backoff");
+
+        // New client (v2): receives the precise backpressure error code.
+        PutKvResultForBucket newClientResult =
+                putOversizedBatch(tb, PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE);
+        assertThat(newClientResult.failed()).isTrue();
+        assertThat(newClientResult.getError().error())
+                .isEqualTo(Errors.STORAGE_BACKPRESSURE_EXCEPTION);
+    }
+
+    /** Puts a single batch that exceeds the 1kb flush budget and returns the bucket result. */
+    private PutKvResultForBucket putOversizedBatch(TableBucket tb, short apiVersion)
+            throws Exception {
+        char[] chars = new char[64 * 1024];
+        Arrays.fill(chars, 'x');
+        KvRecordBatch oversizedBatch = genKvRecordBatch(new Object[] {1, new String(chars)});
+
+        CompletableFuture<List<PutKvResultForBucket>> future = new CompletableFuture<>();
+        replicaManager.putRecordsToKv(
+                20000,
+                1,
+                Collections.singletonMap(tb, oversizedBatch),
+                null,
+                MergeMode.DEFAULT,
+                apiVersion,
+                future::complete);
+        List<PutKvResultForBucket> results = future.get();
+        assertThat(results).hasSize(1);
+        return results.get(0);
+    }
+
+    @Test
     void testPutKvWithOutOfBatchSequence() throws Exception {
         TableBucket tb = new TableBucket(DATA1_TABLE_ID_PK, 1);
         makeKvTableAsLeader(DATA1_TABLE_ID_PK, DATA1_TABLE_PATH_PK, tb.getBucket());
@@ -573,6 +655,9 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 PUT_KV_VERSION,
                 future::complete);
         assertThat(future.get()).containsOnly(new PutKvResultForBucket(tb, 5));
+        // acks = 1 responds before the async KV flush publishes the high watermark; wait for it
+        // before asserting on fetched log results.
+        waitUntilHighWatermark(tb, 5);
 
         // 2. get the cdc-log of this batch (data1).
         List<Tuple2<ChangeType, Object[]>> expectedLogForData1 =
@@ -661,6 +746,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 PUT_KV_VERSION,
                 future::complete);
         assertThat(future.get()).containsOnly(new PutKvResultForBucket(tb, 8));
+        waitUntilHighWatermark(tb, 8);
 
         // 6. get the cdc-log of this batch (data2).
         List<Tuple2<ChangeType, Object[]>> expectedLogForData2 =
@@ -724,6 +810,9 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 PUT_KV_VERSION,
                 future::complete);
         assertThat(future.get()).containsOnly(new PutKvResultForBucket(tb, 18));
+        // acks = 1 responds before the async KV flush publishes the high watermark; wait for it
+        // before asserting on fetched log results.
+        waitUntilHighWatermark(tb, 18);
 
         // 2. get the cdc-log of these batches.
         CompletableFuture<Map<TableBucket, FetchLogResultForBucket>> future1 =
@@ -830,7 +919,9 @@ class ReplicaManagerTest extends ReplicaTestBase {
         verifyLookup(tb, key100, inserted.get(0));
         verifyLookup(tb, key200, inserted.get(1));
 
-        // Verify that corresponding 2 log records were created
+        // Verify that corresponding 2 log records were created. The insert response returns
+        // before the async KV flush publishes the high watermark, so wait for it first.
+        waitUntilHighWatermark(tb, 2);
         FetchLogResultForBucket logResult = fetchLog(tb, 0L);
         assertThat(logResult.getHighWatermark()).isEqualTo(2L);
         LogRecords records = logResult.records();
@@ -855,6 +946,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
         verifyLookup(tb, key300, mixed.get(1));
 
         // Verify that only one new log record was created for key300
+        waitUntilHighWatermark(tb, 3);
         logResult = fetchLog(tb, 2L);
         assertThat(logResult.getHighWatermark()).isEqualTo(3L);
         records = logResult.records();
@@ -902,6 +994,8 @@ class ReplicaManagerTest extends ReplicaTestBase {
         InternalRow row3 = valueDecoder.decodeValue(mixed.get(1)).row;
         assertThat(row3.getLong(2)).isEqualTo(3L); // continues sequence
 
+        // The insert response returns before the async KV flush publishes the high watermark.
+        waitUntilHighWatermark(tb, 3);
         FetchLogResultForBucket logResult = fetchLog(tb, 0L);
         assertThat(logResult.getHighWatermark()).isEqualTo(3L);
         LogRecords records = logResult.records();
@@ -1123,6 +1217,7 @@ class ReplicaManagerTest extends ReplicaTestBase {
                 PUT_KV_VERSION,
                 future::complete);
         assertThat(future.get()).containsOnly(new PutKvResultForBucket(tb, 4));
+
         // second prefix lookup in table, prefix key = (1, "a").
         Object[] prefixKey1 = new Object[] {1, "a"};
         CompactedKeyEncoder keyEncoder = new CompactedKeyEncoder(rowType, new int[] {0, 1});
@@ -2190,10 +2285,24 @@ class ReplicaManagerTest extends ReplicaTestBase {
 
     private void verifyLookup(TableBucket tb, byte[] keyBytes, @Nullable byte[] expectValues)
             throws Exception {
-        CompletableFuture<byte[]> future = new CompletableFuture<>();
-        replicaManager.lookup(tb, keyBytes, future::complete);
-        byte[] lookupValues = future.get();
-        assertThat(lookupValues).isEqualTo(expectValues);
+        // With asynchronous KV flush, an acks = 1 put can complete before the data is readable
+        // from RocksDB; poll until the lookup converges to the expected value.
+        waitUntil(
+                () -> {
+                    CompletableFuture<byte[]> future = new CompletableFuture<>();
+                    replicaManager.lookup(tb, keyBytes, future::complete);
+                    return Arrays.equals(future.get(), expectValues);
+                },
+                Duration.ofSeconds(15),
+                "lookup value for bucket " + tb + " did not converge to the expected value");
+    }
+
+    private void waitUntilHighWatermark(TableBucket tb, long expectedHighWatermark) {
+        Replica replica = replicaManager.getReplicaOrException(tb);
+        waitUntil(
+                () -> replica.getLogHighWatermark() >= expectedHighWatermark,
+                Duration.ofSeconds(15),
+                "high watermark of " + tb + " did not reach " + expectedHighWatermark);
     }
 
     private void verifyPrefixLookup(

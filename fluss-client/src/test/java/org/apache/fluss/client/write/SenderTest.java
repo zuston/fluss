@@ -747,6 +747,79 @@ final class SenderTest {
         assertThat(future.get()).isNull();
     }
 
+    @Test
+    void testPutKvPressureResponseAppliesBucketThrottle() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        CompletableFuture<Exception> future = new CompletableFuture<>();
+        appendKvToAccumulator(
+                tableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> future.complete(e));
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+
+        PutKvResponse response = createPutKvResponse(tableBucket, 1, 0.5f);
+        assertThat(response.getBucketsRespsList().get(0).hasPressure()).isTrue();
+        finishRequest(tableBucket, 0, response);
+
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(0);
+        assertThat(future.get()).isNull();
+        assertThat(accumulator.isThrottled(tableBucket)).isTrue();
+    }
+
+    @Test
+    void testPutKvStorageBackpressureResponseAppliesRetryBackoff() throws Exception {
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        CompletableFuture<Exception> future = new CompletableFuture<>();
+        appendKvToAccumulator(
+                tableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> future.complete(e));
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(
+                tableBucket,
+                0,
+                createPutKvResponse(tableBucket, Errors.STORAGE_BACKPRESSURE_EXCEPTION));
+
+        assertThat(accumulator.isThrottled(tableBucket)).isTrue();
+        assertThat(future.isDone()).isFalse();
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(0);
+        assertThat(pendingRequestSize(tableBucket)).isEqualTo(0);
+    }
+
+    @Test
+    void testPutKvStorageExceptionResponseRetriesInsteadOfFailing() throws Exception {
+        // Rolling-upgrade anchor: an old client receives the server-side downgraded
+        // KV_STORAGE_EXCEPTION (instead of the unknown error code 72, which would map to the
+        // non-retriable UNKNOWN_SERVER_ERROR) and must retry the batch instead of failing it.
+        TableBucket tableBucket = new TableBucket(DATA1_TABLE_ID_PK, 0);
+        CompletableFuture<Exception> future = new CompletableFuture<>();
+        appendKvToAccumulator(
+                tableBucket,
+                compactedRow(DATA1_ROW_TYPE, new Object[] {1, "a"}),
+                (tb, leo, e) -> future.complete(e));
+
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(
+                tableBucket, 0, createPutKvResponse(tableBucket, Errors.KV_STORAGE_EXCEPTION));
+
+        // The batch is re-enqueued for retry rather than completed with an exception.
+        assertThat(future.isDone()).isFalse();
+
+        // Unlike STORAGE_BACKPRESSURE_EXCEPTION, no throttle is installed, so the retried batch
+        // is sent out again immediately and completes once the server recovers.
+        sender.runOnce();
+        assertThat(sender.numOfInFlightBatches(tableBucket)).isEqualTo(1);
+        finishRequest(tableBucket, 0, createPutKvResponse(tableBucket, 1L));
+        assertThat(future.get()).isNull();
+    }
+
     private TestingMetadataUpdater initializeMetadataUpdater() {
         Map<TablePath, TableInfo> tableInfos = new HashMap<>();
         tableInfos.put(DATA1_TABLE_PATH, DATA1_TABLE_INFO);
@@ -761,6 +834,25 @@ final class SenderTest {
                 writeCallback,
                 metadataUpdater.getCluster(),
                 tb.getBucket(),
+                false);
+    }
+
+    private void appendKvToAccumulator(
+            TableBucket tableBucket, BinaryRow row, WriteCallback writeCallback) throws Exception {
+        int[] pkIndex = DATA1_SCHEMA_PK.getPrimaryKeyIndexes();
+        byte[] key = new CompactedKeyEncoder(DATA1_ROW_TYPE, pkIndex).encodeKey(row);
+        accumulator.append(
+                WriteRecord.forUpsert(
+                        DATA1_TABLE_INFO_PK,
+                        PhysicalTablePath.of(DATA1_TABLE_PATH_PK),
+                        row,
+                        key,
+                        key,
+                        WriteFormat.COMPACTED_KV,
+                        null),
+                writeCallback,
+                metadataUpdater.getCluster(),
+                tableBucket.getBucket(),
                 false);
     }
 
@@ -816,6 +908,11 @@ final class SenderTest {
     private PutKvResponse createPutKvResponse(TableBucket tb, long endOffset) {
         return makePutKvResponse(
                 Collections.singletonList(new PutKvResultForBucket(tb, endOffset)));
+    }
+
+    private PutKvResponse createPutKvResponse(TableBucket tb, long endOffset, float pressure) {
+        return makePutKvResponse(
+                Collections.singletonList(new PutKvResultForBucket(tb, endOffset, pressure)));
     }
 
     private PutKvResponse createPutKvResponse(TableBucket tb, Errors error) {

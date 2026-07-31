@@ -29,6 +29,7 @@ import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
+import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.exception.UnsupportedVersionException;
@@ -156,6 +157,15 @@ public class ReplicaManager {
     private static final Logger LOG = LoggerFactory.getLogger(ReplicaManager.class);
 
     public static final String HIGH_WATERMARK_CHECKPOINT_FILE_NAME = "high-watermark-checkpoint";
+
+    /**
+     * The first PUT_KV API version whose clients understand the {@link
+     * Errors#STORAGE_BACKPRESSURE_EXCEPTION} error code (72). Rejections for older versions are
+     * downgraded to the retriable {@link Errors#KV_STORAGE_EXCEPTION} to keep rolling upgrades
+     * safe.
+     */
+    private static final short PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE = 2;
+
     private final Configuration conf;
     private final Scheduler scheduler;
     private final LogManager logManager;
@@ -810,8 +820,11 @@ public class ReplicaManager {
                 continue; // Skip buckets that failed during insert
             }
             MissingKeysContext missingKeysContext = entry.getValue();
+            // Read through the pre-write buffer: with acks != -1 the response (and thus this
+            // re-lookup) can run before the asynchronous flush has materialized the insert into
+            // RocksDB, but the inserted entries are already visible in the pre-write buffer.
             List<byte[]> results =
-                    getReplicaOrException(tb).lookups(missingKeysContext.missingKeys);
+                    getReplicaOrException(tb).lookupsFromBufferOrKv(missingKeysContext.missingKeys);
             LookupResultForBucket lookupResult = lookupResultForBucketMap.get(tb);
             for (int i = 0; i < missingKeysContext.missingIndexes.size(); i++) {
                 lookupResult
@@ -1276,8 +1289,13 @@ public class ReplicaManager {
                         tb,
                         appendInfo.firstOffset(),
                         appendInfo.lastOffset());
+                // Sample the piggyback backpressure pressure right after the write, so the
+                // result is immutable and both the immediate (acks != -1) and the delayed
+                // (acks == -1) response paths carry it without any post-filling.
                 putResultForBucketMap.put(
-                        tb, new PutKvResultForBucket(tb, appendInfo.lastOffset() + 1));
+                        tb,
+                        new PutKvResultForBucket(
+                                tb, appendInfo.lastOffset() + 1, replica.samplePressure()));
 
                 // metric for kv
                 tableMetrics.incKvMessageIn(entry.getValue().getRecordCount());
@@ -1286,7 +1304,29 @@ public class ReplicaManager {
                 tableMetrics.incLogBytesIn(appendInfo.validBytes());
                 tableMetrics.incLogMessageIn(appendInfo.numMessages());
             } catch (Exception e) {
-                if (isUnexpectedException(e)) {
+                if (e instanceof StorageBackpressureException) {
+                    // Fluss application-layer write rejection (L0 headroom or flush budget
+                    // exceeded). This is a designed backpressure signal, not a server failure.
+                    // Increment the backpressure rejection counter; do NOT increment
+                    // failedPutKvRequests or log at ERROR level.
+                    if (tableMetrics != null) {
+                        tableMetrics.incKvBackpressureRejectedRequests();
+                    }
+                    LOG.debug("Write rejected by KV backpressure for table bucket {}", tb);
+                    if (apiVersion < PUT_KV_VERSION_WITH_STORAGE_BACKPRESSURE) {
+                        // Rolling-upgrade compatibility: pre-upgrade clients map the unknown
+                        // error code 72 to the non-retriable UNKNOWN_SERVER_ERROR and would fail
+                        // the write. Downgrade to the retriable KV_STORAGE_EXCEPTION (known since
+                        // 0.1) so their standard retry path backs off, keeping the original
+                        // message for diagnosability.
+                        putResultForBucketMap.put(
+                                tb,
+                                new PutKvResultForBucket(
+                                        tb,
+                                        new ApiError(Errors.KV_STORAGE_EXCEPTION, e.getMessage())));
+                        continue;
+                    }
+                } else if (isUnexpectedException(e)) {
                     LOG.error("Error put records to local kv on replica {}", tb, e);
                     // NOTE: Failed put requests metric is not incremented for known exceptions
                     // since it is supposed to indicate un-expected failure of a server in
@@ -1577,7 +1617,8 @@ public class ReplicaManager {
     private boolean isUnexpectedException(Exception e) {
         return !(e instanceof UnknownTableOrBucketException
                 || e instanceof NotLeaderOrFollowerException
-                || e instanceof LogOffsetOutOfRangeException);
+                || e instanceof LogOffsetOutOfRangeException
+                || e instanceof StorageBackpressureException);
     }
 
     /**

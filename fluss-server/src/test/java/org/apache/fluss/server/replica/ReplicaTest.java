@@ -18,6 +18,7 @@
 package org.apache.fluss.server.replica;
 
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
@@ -35,7 +36,9 @@ import org.apache.fluss.record.MemoryLogRecords;
 import org.apache.fluss.record.ProjectionPushdownCache;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.kv.KvFlushScheduler;
 import org.apache.fluss.server.kv.KvTablet;
+import org.apache.fluss.server.kv.TestingHoldableKvFlushScheduler;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.TestingCompletedKvSnapshotCommitter;
@@ -43,7 +46,6 @@ import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.LogAppendInfo;
 import org.apache.fluss.server.log.LogReadInfo;
 import org.apache.fluss.server.testutils.KvTestUtils;
-import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.testutils.DataTestUtils;
 import org.apache.fluss.testutils.common.ManuallyTriggeredScheduledExecutorService;
@@ -86,6 +88,7 @@ import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
+import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
 import static org.apache.fluss.server.zk.data.LeaderAndIsr.INITIAL_LEADER_EPOCH;
 import static org.apache.fluss.testutils.DataTestUtils.assertLogRecordsEquals;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
@@ -104,6 +107,16 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 final class ReplicaTest extends ReplicaTestBase {
     // TODO add more tests refer to kafka's PartitionTest.
     // TODO add more tests to cover partition table
+
+    private TestingHoldableKvFlushScheduler holdableKvFlushScheduler;
+
+    @Override
+    protected KvFlushScheduler createTestKvFlushScheduler(Configuration conf) {
+        // Pass-through by default; individual tests call holdFlushes() when they need
+        // deterministic control over the asynchronous KV flush.
+        holdableKvFlushScheduler = new TestingHoldableKvFlushScheduler(conf);
+        return holdableKvFlushScheduler;
+    }
 
     @Test
     void testMakeLeader() throws Exception {
@@ -279,6 +292,62 @@ final class ReplicaTest extends ReplicaTestBase {
                 .withSchema(DATA1_ROW_TYPE)
                 .withSchemaGetter(kvReplica.getSchemaGetter())
                 .isEqualTo(expected);
+    }
+
+    @Test
+    void testHighWatermarkAdvancesToCompletedFlushOffsetBeforeNewerTarget() throws Exception {
+        Replica kvReplica =
+                makeKvReplica(DATA1_PHYSICAL_TABLE_PATH_PK, new TableBucket(DATA1_TABLE_ID_PK, 1));
+        makeKvReplicaAsLeader(kvReplica);
+        KvTablet kvTablet = checkNotNull(kvReplica.getKvTablet());
+
+        KvRecordTestUtils.KvRecordFactory kvRecordFactory =
+                KvRecordTestUtils.KvRecordFactory.of(DATA1_ROW_TYPE);
+        KvRecordTestUtils.KvRecordBatchFactory kvRecordBatchFactory =
+                KvRecordTestUtils.KvRecordBatchFactory.of(DEFAULT_SCHEMA_ID);
+
+        // Hold asynchronous flushes and detach the flush-complete listener, so the test controls
+        // exactly which flush progress each high watermark attempt observes. The attempts under
+        // test are the real ones performed by putRecordsToLeader.
+        holdableKvFlushScheduler.holdFlushes();
+        kvTablet.setFlushCompleteListener(null);
+
+        // Write 1: LEO = 1 while the flush is held at 0, so the HW cannot advance yet.
+        kvReplica.putRecordsToLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k1", new Object[] {1, "a"})),
+                null,
+                MergeMode.DEFAULT,
+                0);
+        assertThat(kvReplica.getLocalLogEndOffset()).isEqualTo(1);
+        assertThat(kvReplica.getLogHighWatermark()).isEqualTo(0);
+
+        // Run the held flush synchronously: the flush target 1 is now fully materialized.
+        holdableKvFlushScheduler.runHeldFlushes();
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(1);
+
+        // Write 2 moves the HW candidate to 2 while the completed flush is still at 1. The HW
+        // attempt during this write must advance the HW to the completed flush offset 1 instead
+        // of returning without progress just because a newer candidate appeared.
+        kvReplica.putRecordsToLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k2", new Object[] {2, "b"})),
+                null,
+                MergeMode.DEFAULT,
+                0);
+        assertThat(kvReplica.getLocalLogEndOffset()).isEqualTo(2);
+        assertThat(kvReplica.getLogHighWatermark()).isEqualTo(1);
+
+        // After the remaining flush completes, the next attempt publishes the final HW.
+        holdableKvFlushScheduler.runHeldFlushes();
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(2);
+        kvReplica.putRecordsToLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord("k3", new Object[] {3, "c"})),
+                null,
+                MergeMode.DEFAULT,
+                0);
+        assertThat(kvReplica.getLogHighWatermark()).isEqualTo(2);
     }
 
     @Test
@@ -918,7 +987,7 @@ final class ReplicaTest extends ReplicaTestBase {
                 replica.putRecordsToLeader(kvRecords, targetColumns, MergeMode.DEFAULT, 0);
         KvTablet kvTablet = checkNotNull(replica.getKvTablet());
         // flush to make data visible
-        kvTablet.flush(replica.getLocalLogEndOffset(), NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, replica.getLocalLogEndOffset());
         return logAppendInfo;
     }
 

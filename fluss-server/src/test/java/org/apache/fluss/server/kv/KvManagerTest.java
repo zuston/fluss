@@ -67,6 +67,7 @@ import java.util.Optional;
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
+import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link KvManager} . */
@@ -347,7 +348,7 @@ final class KvManagerTest {
         KvRecordBatch kvRecordBatch = factory.ofRecords(Arrays.asList(kvRecords));
         kvTablet.putAsLeader(kvRecordBatch, null);
         // flush to make sure data is visible
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
     }
 
     private KvTablet getOrCreateKv(
@@ -379,7 +380,8 @@ final class KvManagerTest {
                 KvFormat.COMPACTED,
                 schemaGetter,
                 new TableConfig(new Configuration()),
-                DEFAULT_COMPRESSION);
+                DEFAULT_COMPRESSION,
+                null);
     }
 
     private byte[] valueOf(KvRecord kvRecord) {

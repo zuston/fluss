@@ -19,10 +19,12 @@ package org.apache.fluss.server.kv;
 
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.InvalidTargetColumnException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
+import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.memory.TestingMemorySegmentPool;
 import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.KvFormat;
@@ -54,6 +56,7 @@ import org.apache.fluss.server.kv.autoinc.AutoIncrementManager;
 import org.apache.fluss.server.kv.autoinc.TestingSequenceGeneratorFactory;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Key;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.KvEntry;
+import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.PreparedFlush;
 import org.apache.fluss.server.kv.prewrite.KvPreWriteBuffer.Value;
 import org.apache.fluss.server.kv.rocksdb.RocksDBStatistics;
 import org.apache.fluss.server.kv.rowmerger.RowMerger;
@@ -78,6 +81,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.rocksdb.FlushOptions;
 
 import javax.annotation.Nullable;
 
@@ -88,6 +92,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -104,6 +109,7 @@ import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA2_ROW_TYPE;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
 import static org.apache.fluss.record.TestData.DEFAULT_SCHEMA_ID;
+import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
 import static org.apache.fluss.testutils.DataTestUtils.compactedRow;
 import static org.apache.fluss.testutils.DataTestUtils.createBasicMemoryLogRecords;
 import static org.apache.fluss.testutils.LogRecordsAssert.assertThatLogRecords;
@@ -136,7 +142,13 @@ class KvTabletTest {
     }
 
     @AfterEach
-    void afterEach() {
+    void afterEach() throws Exception {
+        if (kvTablet != null) {
+            kvTablet.close();
+        }
+        if (logTablet != null) {
+            logTablet.close();
+        }
         if (executor != null) {
             executor.shutdown();
         }
@@ -191,6 +203,19 @@ class KvTabletTest {
             SchemaGetter schemaGetter,
             Map<String, String> tableConfig)
             throws Exception {
+        return createKvTablet(
+                tablePath, tableBucket, logTablet, tmpKvDir, schemaGetter, tableConfig, null);
+    }
+
+    private KvTablet createKvTablet(
+            PhysicalTablePath tablePath,
+            TableBucket tableBucket,
+            LogTablet logTablet,
+            File tmpKvDir,
+            SchemaGetter schemaGetter,
+            Map<String, String> tableConfig,
+            @Nullable KvFlushScheduler kvFlushScheduler)
+            throws Exception {
         TableConfig tableConf = new TableConfig(Configuration.fromMap(tableConfig));
         RowMerger rowMerger = RowMerger.create(tableConf, KvFormat.COMPACTED, schemaGetter);
         AutoIncrementManager autoIncrementManager =
@@ -200,6 +225,24 @@ class KvTabletTest {
                         new TableConfig(new Configuration()),
                         new TestingSequenceGeneratorFactory());
 
+        if (kvFlushScheduler == null) {
+            return KvTablet.create(
+                    tablePath,
+                    tableBucket,
+                    logTablet,
+                    tmpKvDir,
+                    conf,
+                    TestingMetricGroups.TABLET_SERVER_METRICS,
+                    new RootAllocator(Long.MAX_VALUE),
+                    new TestingMemorySegmentPool(10 * 1024),
+                    KvFormat.COMPACTED,
+                    rowMerger,
+                    DEFAULT_COMPRESSION,
+                    schemaGetter,
+                    tableConf.getChangelogImage(),
+                    KvManager.getDefaultRateLimiter(),
+                    autoIncrementManager);
+        }
         return KvTablet.create(
                 tablePath,
                 tableBucket,
@@ -215,6 +258,8 @@ class KvTabletTest {
                 schemaGetter,
                 tableConf.getChangelogImage(),
                 KvManager.getDefaultRateLimiter(),
+                kvFlushScheduler,
+                null,
                 autoIncrementManager);
     }
 
@@ -1445,6 +1490,371 @@ class KvTabletTest {
     }
 
     @Test
+    void testPutAsLeaderRejectsCurrentBatchThatExceedsFlushBudget() throws Exception {
+        conf.set(ConfigOptions.KV_WRITE_BUFFER_SIZE, MemorySize.parse("1kb"));
+        initLogTabletAndKvTablet(DATA1_SCHEMA_PK, new HashMap<>());
+
+        char[] chars = new char[64 * 1024];
+        Arrays.fill(chars, 'x');
+        KvRecordBatch largeBatch =
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(
+                                "large-key".getBytes(), new Object[] {1, new String(chars)}));
+
+        assertThat(largeBatch.sizeInBytes()).isGreaterThan(18 * 1024);
+        assertThatThrownBy(() -> kvTablet.putAsLeader(largeBatch, null))
+                .isInstanceOf(StorageBackpressureException.class);
+        assertThat(logTablet.localLogEndOffset()).isEqualTo(0L);
+    }
+
+    @Test
+    void testSuccessfulNonEmptyFlushClearsWriteRejectionAdmission() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        byte[] key = "k1".getBytes();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "a"})),
+                null);
+        long flushOffset = logTablet.localLogEndOffset();
+
+        kvTablet.getRocksDBKv().recordWriteRejected();
+        assertThat(kvTablet.getRocksDBKv().wouldExceedFlushBudget(0)).isTrue();
+
+        // Run a real non-empty flush through the scheduler path; its successful RocksDB write
+        // must clear the raised write-rejection admission.
+        kvTablet.requestFlush(flushOffset, NOPErrorHandler.INSTANCE);
+        kvTablet.runScheduledFlush();
+
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(flushOffset);
+        assertThat(kvTablet.getRocksDBKv().wouldExceedFlushBudget(0)).isFalse();
+    }
+
+    @Test
+    void testOrphanedPreparedFlushEntriesAreRetried() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        byte[] key = "k1".getBytes();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "a"})),
+                null);
+        long flushOffset = logTablet.localLogEndOffset();
+
+        kvTablet.requestFlush(flushOffset, NOPErrorHandler.INSTANCE);
+        kvTablet.getKvPreWriteBuffer().prepareFlush(flushOffset);
+        kvTablet.runScheduledFlush();
+
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.STORAGE_BLOCKED);
+        assertThat(manualScheduler.retryCount).isEqualTo(1);
+        assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isGreaterThan(0);
+    }
+
+    @Test
+    void testScheduledFlushWritesLargePreparedRangeInSegments() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        // 1200 records force the prepared range to be written as multiple native segments
+        // (500 records each), exercising the per-segment completion of the scheduled flush.
+        int recordCount = 1200;
+        List<KvRecord> records = new ArrayList<>(recordCount);
+        for (int i = 0; i < recordCount; i++) {
+            records.add(kvRecordFactory.ofRecord("key" + i, new Object[] {i, "v" + i}));
+        }
+        kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(records), null);
+        long flushOffset = logTablet.localLogEndOffset();
+
+        kvTablet.requestFlush(flushOffset, NOPErrorHandler.INSTANCE);
+        kvTablet.runScheduledFlush();
+
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(flushOffset);
+        assertThat(kvTablet.getRowCount()).isEqualTo(recordCount);
+        assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isEqualTo(0);
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.IDLE);
+        // Spot-check that data of every segment is readable from RocksDB.
+        assertThat(
+                        kvTablet.multiGet(
+                                Arrays.asList(
+                                        "key0".getBytes(),
+                                        "key600".getBytes(),
+                                        "key1199".getBytes())))
+                .noneMatch(Objects::isNull);
+    }
+
+    @Test
+    void testScheduledFlushAttemptsWriteDespiteRocksDbPressureSignal() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        byte[] key = "flush-key".getBytes();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "a"})),
+                null);
+        long flushOffset = logTablet.localLogEndOffset();
+
+        flushRocksDbL0Files(kvTablet, 18);
+        Thread.sleep(20L);
+
+        kvTablet.requestFlush(flushOffset, NOPErrorHandler.INSTANCE);
+        kvTablet.runScheduledFlush();
+
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(flushOffset);
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.IDLE);
+        assertThat(manualScheduler.retryCount).isEqualTo(0);
+        assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isEqualTo(0);
+    }
+
+    @Test
+    void testFlushBackpressureRetryBackoffGrowsAndResetsAfterProgress() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        byte[] key = "k1".getBytes();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "a"})),
+                null);
+        long flushOffset = logTablet.localLogEndOffset();
+
+        // Model three blocked flush runs: a worker claims each run (RUNNING) and hits storage
+        // backpressure, so the backoff grows exponentially.
+        kvTablet.setFlushState(KvTablet.FlushState.RUNNING);
+        kvTablet.delayScheduledFlush(new StorageBackpressureException("test"));
+        kvTablet.setFlushState(KvTablet.FlushState.RUNNING);
+        kvTablet.delayScheduledFlush(new StorageBackpressureException("test"));
+        kvTablet.setFlushState(KvTablet.FlushState.RUNNING);
+        kvTablet.delayScheduledFlush(new StorageBackpressureException("test"));
+
+        assertThat(manualScheduler.retryDelaysMs).containsExactly(100L, 200L, 400L);
+
+        PreparedFlush preparedFlush = kvTablet.getKvPreWriteBuffer().prepareFlush(flushOffset);
+        kvTablet.setFlushState(KvTablet.FlushState.RUNNING);
+        kvTablet.completeScheduledFlush(preparedFlush);
+
+        kvTablet.setFlushState(KvTablet.FlushState.RUNNING);
+        kvTablet.delayScheduledFlush(new StorageBackpressureException("test"));
+
+        assertThat(manualScheduler.retryDelaysMs).containsExactly(100L, 200L, 400L, 100L);
+    }
+
+    @Test
+    void testBlockedFlushRetryIncludesWritesAppendedBeforeRetry() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        byte[] key = "retry-key".getBytes();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "old"})),
+                null);
+        long firstFlushOffset = logTablet.localLogEndOffset();
+        kvTablet.requestFlush(firstFlushOffset, NOPErrorHandler.INSTANCE);
+
+        PreparedFlush firstAttempt = kvTablet.getKvPreWriteBuffer().prepareFlush(firstFlushOffset);
+        kvTablet.abortScheduledFlush(firstAttempt);
+        // Model a worker that claimed the queued task (RUNNING) and got blocked by storage.
+        kvTablet.setFlushState(KvTablet.FlushState.RUNNING);
+        kvTablet.delayScheduledFlush(new StorageBackpressureException("test"));
+
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.STORAGE_BLOCKED);
+        assertThat(manualScheduler.retryDelaysMs).containsExactly(100L);
+
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "new"})),
+                null);
+        long secondFlushOffset = logTablet.localLogEndOffset();
+        kvTablet.requestFlush(secondFlushOffset, NOPErrorHandler.INSTANCE);
+
+        kvTablet.requestFlushRetry();
+        assertThat(manualScheduler.enqueueCount).isEqualTo(2);
+
+        kvTablet.runScheduledFlush();
+
+        byte[] expectedValue =
+                ValueEncoder.encodeValue(
+                        schemaId, compactedRow(baseRowType, new Object[] {1, "new"}));
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(secondFlushOffset);
+        assertThat(kvTablet.multiGet(Collections.singletonList(key)))
+                .containsExactly(expectedValue);
+        assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isEqualTo(0);
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.IDLE);
+    }
+
+    @Test
+    void testStaleScheduledFlushTaskDoesNotRunWhenFlushAlreadyOwned() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        byte[] key = "owned-flush-key".getBytes();
+        kvTablet.putAsLeader(
+                kvRecordBatchFactory.ofRecords(
+                        kvRecordFactory.ofRecord(key, new Object[] {1, "value"})),
+                null);
+        long flushOffset = logTablet.localLogEndOffset();
+        kvTablet.requestFlush(flushOffset, NOPErrorHandler.INSTANCE);
+        kvTablet.setFlushState(KvTablet.FlushState.RUNNING);
+        long pendingBefore = kvTablet.getKvPreWriteBuffer().pendingFlushBytes();
+
+        kvTablet.runScheduledFlush();
+
+        assertThat(kvTablet.getFlushedLogOffset()).isEqualTo(0L);
+        assertThat(kvTablet.getKvPreWriteBuffer().pendingFlushBytes()).isEqualTo(pendingBefore);
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.RUNNING);
+        assertThat(manualScheduler.retryCount).isEqualTo(0);
+    }
+
+    @Test
+    void testPendingFlushRetryDoesNotReviveClosedTablet() throws Exception {
+        ManualKvFlushScheduler manualScheduler = new ManualKvFlushScheduler(conf);
+        PhysicalTablePath physicalTablePath = PhysicalTablePath.of(TablePath.of("testDb", "t1"));
+        schemaGetter = new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, schemaId));
+        logTablet = createLogTablet(tempLogDir, 0L, physicalTablePath);
+        kvTablet =
+                createKvTablet(
+                        physicalTablePath,
+                        logTablet.getTableBucket(),
+                        logTablet,
+                        tmpKvDir,
+                        schemaGetter,
+                        new HashMap<>(),
+                        manualScheduler);
+
+        kvTablet.setFlushState(KvTablet.FlushState.STORAGE_BLOCKED);
+        kvTablet.close();
+
+        // Model the delayed retry timer callback firing after the tablet was closed: it must not
+        // re-enqueue the tablet.
+        kvTablet.requestFlushRetry();
+
+        assertThat(manualScheduler.enqueueCount).isEqualTo(0);
+        assertThat(kvTablet.getFlushState()).isEqualTo(KvTablet.FlushState.IDLE);
+    }
+
+    private static void flushRocksDbL0Files(KvTablet tablet, int count) throws Exception {
+        for (int i = 0; i < count; i++) {
+            byte[] key = ("l0-pressure-" + i).getBytes();
+            tablet.getRocksDBKv().put(key, key);
+            try (FlushOptions flushOptions = new FlushOptions()) {
+                flushOptions.setWaitForFlush(true);
+                tablet.getRocksDBKv().getDb().flush(flushOptions);
+            }
+        }
+    }
+
+    private static final class ManualKvFlushScheduler extends KvFlushScheduler {
+        private int enqueueCount;
+        private int retryCount;
+        private final List<Long> retryDelaysMs = new ArrayList<>();
+
+        private ManualKvFlushScheduler(Configuration conf) {
+            super();
+        }
+
+        @Override
+        public void enqueue(KvTablet tablet) {
+            enqueueCount++;
+        }
+
+        @Override
+        public void retryLater(KvTablet tablet) {
+            retryLater(tablet, 100L);
+        }
+
+        @Override
+        public void retryLater(KvTablet tablet, long delayMs) {
+            retryCount++;
+            retryDelaysMs.add(delayMs);
+        }
+
+        @Override
+        public void close() {
+            // No-op.
+        }
+    }
+
+    @Test
     void testRocksDBMetrics() throws Exception {
         // Initialize tablet with schema
         initLogTabletAndKvTablet(DATA1_SCHEMA_PK, new HashMap<>());
@@ -1478,7 +1888,7 @@ class KvTabletTest {
                             String.valueOf(i).getBytes(), new Object[] {i, "value-" + i}));
         }
         kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(rows), null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
 
         // After write and flush: must have written data to RocksDB
         long bytesWrittenAfterFlush = statistics.getBytesWritten();
@@ -1537,7 +1947,7 @@ class KvTabletTest {
                             String.valueOf(i).getBytes(), new Object[] {i, "value-" + i}));
         }
         kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(moreRows), null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
 
         // Bytes written must increase with more data
         long bytesWrittenAfterSecondFlush = statistics.getBytesWritten();
@@ -1688,7 +2098,7 @@ class KvTabletTest {
                             kvRecordFactory.ofRecord("key" + i, new Object[] {i, "val" + i}));
             kvTablet.putAsLeader(batch, null);
         }
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
 
         // Row count should be 5
         assertThat(kvTablet.getRowCount()).isEqualTo(5);
@@ -1699,7 +2109,7 @@ class KvTabletTest {
                     kvRecordBatchFactory.ofRecords(kvRecordFactory.ofRecord("key" + i, null));
             kvTablet.putAsLeader(deleteBatch, null);
         }
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
 
         // Row count should be 3
         assertThat(kvTablet.getRowCount()).isEqualTo(3);
@@ -1719,7 +2129,7 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("key1", new Object[] {1, "val1"}));
         kvTablet.putAsLeader(batch1, null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
         assertThat(kvTablet.getRowCount()).isEqualTo(1);
 
         // Update the same record (upsert) - row count should not change
@@ -1727,7 +2137,7 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("key1", new Object[] {1, "val1_updated"}));
         kvTablet.putAsLeader(batch2, null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
         assertThat(kvTablet.getRowCount()).isEqualTo(1);
 
         // Insert another record
@@ -1735,7 +2145,7 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("key2", new Object[] {2, "val2"}));
         kvTablet.putAsLeader(batch3, null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
         assertThat(kvTablet.getRowCount()).isEqualTo(2);
 
         kvTablet.close();
@@ -1753,7 +2163,7 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("key1", new Object[] {1, "val1"}));
         kvTablet.putAsLeader(batch, null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
 
         // Getting row count should throw exception for WAL changelog mode
         assertThatThrownBy(() -> kvTablet.getRowCount())
@@ -1777,7 +2187,7 @@ class KvTabletTest {
         }
         KvRecordBatch insertBatch = kvRecordBatchFactory.ofRecords(records);
         kvTablet.putAsLeader(insertBatch, null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
         assertThat(kvTablet.getRowCount()).isEqualTo(10);
 
         // Delete some, insert new ones, update existing ones in sequence
@@ -1787,7 +2197,7 @@ class KvTabletTest {
             deleteRecords.add(kvRecordFactory.ofRecord("key" + i, null));
         }
         kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(deleteRecords), null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
         assertThat(kvTablet.getRowCount()).isEqualTo(7);
 
         // Insert new keys 11-15
@@ -1796,7 +2206,7 @@ class KvTabletTest {
             newRecords.add(kvRecordFactory.ofRecord("key" + i, new Object[] {i, "val" + i}));
         }
         kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(newRecords), null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
         assertThat(kvTablet.getRowCount()).isEqualTo(12);
 
         // Update existing key 4 - row count should not change
@@ -1804,7 +2214,7 @@ class KvTabletTest {
                 kvRecordBatchFactory.ofRecords(
                         kvRecordFactory.ofRecord("key4", new Object[] {4, "val4_updated"}));
         kvTablet.putAsLeader(updateBatch, null);
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
         assertThat(kvTablet.getRowCount()).isEqualTo(12);
 
         kvTablet.close();
@@ -1827,14 +2237,14 @@ class KvTabletTest {
         kvTablet.putAsLeader(kvRecordBatchFactory.ofRecords(deletes), null);
 
         long highOffset = logTablet.localLogEndOffset();
-        kvTablet.flush(highOffset, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, highOffset);
         TabletState stateAfterHighFlush = kvTablet.getTabletState();
         assertThat(stateAfterHighFlush.getFlushedLogOffset()).isEqualTo(highOffset);
         assertThat(stateAfterHighFlush.getRowCount()).isEqualTo(3L);
         assertThat(kvTablet.getRowCount()).isEqualTo(3);
 
         long lowOffset = highOffset - 2;
-        kvTablet.flush(lowOffset, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, lowOffset);
         TabletState stateAfterLowFlush = kvTablet.getTabletState();
 
         assertThat(stateAfterLowFlush.getFlushedLogOffset()).isEqualTo(highOffset);
