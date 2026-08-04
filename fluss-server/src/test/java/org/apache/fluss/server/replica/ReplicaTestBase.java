@@ -362,7 +362,8 @@ public class ReplicaTestBase {
                 remoteLogManager,
                 manualClock,
                 ioExecutor,
-                localDiskManager);
+                localDiskManager,
+                null);
     }
 
     @AfterEach

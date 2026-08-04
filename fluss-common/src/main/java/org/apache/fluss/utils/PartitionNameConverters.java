@@ -21,6 +21,7 @@ import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
 
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -129,5 +130,111 @@ public class PartitionNameConverters {
                 .toLocalDateTime()
                 .atOffset(ZoneOffset.UTC)
                 .format(TimestampFormatter);
+    }
+
+    /** Parses a hex string back to a byte array. */
+    public static byte[] parseHexString(String hex) {
+        if ((hex.length() & 1) != 0) {
+            throw new IllegalArgumentException("Hex partition value must have an even length.");
+        }
+        byte[] bytes = new byte[hex.length() / 2];
+        for (int i = 0; i < hex.length(); i += 2) {
+            int high = Character.digit(hex.charAt(i), 16);
+            int low = Character.digit(hex.charAt(i + 1), 16);
+            if (high < 0 || low < 0) {
+                throw new IllegalArgumentException("Invalid hex partition value: " + hex);
+            }
+            bytes[i / 2] = (byte) ((high << 4) + low);
+        }
+        return bytes;
+    }
+
+    /** Parses a formatted date back to days since the epoch. */
+    public static int parseDayString(String value) {
+        String[] parts = value.split("-");
+        LocalDateTime date =
+                LocalDateTime.of(
+                        Integer.parseInt(parts[0]),
+                        Integer.parseInt(parts[1]),
+                        Integer.parseInt(parts[2]),
+                        0,
+                        0);
+        return (int) date.toLocalDate().toEpochDay();
+    }
+
+    /** Parses a formatted time back to milliseconds of day. */
+    public static int parseMilliString(String value) {
+        String[] mainParts = value.split("_");
+        String[] timeParts = mainParts[0].split("-");
+        return Integer.parseInt(timeParts[0]) * 3_600_000
+                + Integer.parseInt(timeParts[1]) * 60_000
+                + Integer.parseInt(timeParts[2]) * 1_000
+                + Integer.parseInt(mainParts[1]);
+    }
+
+    public static Float parseFloat(String value) {
+        if ("NaN".equals(value)) {
+            return Float.NaN;
+        } else if ("Inf".equals(value)) {
+            return Float.POSITIVE_INFINITY;
+        } else if ("-Inf".equals(value)) {
+            return Float.NEGATIVE_INFINITY;
+        }
+        return Float.parseFloat(value.replace("_", "."));
+    }
+
+    public static Double parseDouble(String value) {
+        if ("NaN".equals(value)) {
+            return Double.NaN;
+        } else if ("Inf".equals(value)) {
+            return Double.POSITIVE_INFINITY;
+        } else if ("-Inf".equals(value)) {
+            return Double.NEGATIVE_INFINITY;
+        }
+        return Double.parseDouble(value.replace("_", "."));
+    }
+
+    public static TimestampNtz parseTimestampNtz(String value) {
+        long[] millisAndNano = parseTimestampString(value);
+        return TimestampNtz.fromMillis(millisAndNano[0], (int) millisAndNano[1]);
+    }
+
+    public static TimestampLtz parseTimestampLtz(String value) {
+        long[] millisAndNano = parseTimestampString(value);
+        return TimestampLtz.fromEpochMillis(millisAndNano[0], (int) millisAndNano[1]);
+    }
+
+    private static long[] parseTimestampString(String value) {
+        int underscoreIndex = value.lastIndexOf('_');
+        String dateTimePart = underscoreIndex >= 0 ? value.substring(0, underscoreIndex) : value;
+        String nanoPart = underscoreIndex >= 0 ? value.substring(underscoreIndex + 1) : "";
+
+        String[] parts = dateTimePart.split("-");
+        int hour = parts.length > 3 ? Integer.parseInt(parts[3]) : 0;
+        int minute = parts.length > 4 ? Integer.parseInt(parts[4]) : 0;
+        int second = parts.length > 5 ? Integer.parseInt(parts[5]) : 0;
+        LocalDateTime dateTime =
+                LocalDateTime.of(
+                        Integer.parseInt(parts[0]),
+                        Integer.parseInt(parts[1]),
+                        Integer.parseInt(parts[2]),
+                        hour,
+                        minute,
+                        second);
+        long epochMillis =
+                dateTime.toLocalDate().toEpochDay() * 86_400_000L
+                        + dateTime.toLocalTime().toSecondOfDay() * 1_000L;
+
+        int nanoOfMillisecond = 0;
+        if (!nanoPart.isEmpty()) {
+            StringBuilder paddedNano = new StringBuilder(nanoPart);
+            while (paddedNano.length() < 9) {
+                paddedNano.append('0');
+            }
+            long nanoOfSecond = Long.parseLong(paddedNano.toString());
+            epochMillis += nanoOfSecond / 1_000_000;
+            nanoOfMillisecond = (int) (nanoOfSecond % 1_000_000);
+        }
+        return new long[] {epochMillis, nanoOfMillisecond};
     }
 }

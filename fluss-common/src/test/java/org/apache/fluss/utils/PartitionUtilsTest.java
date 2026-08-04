@@ -19,6 +19,7 @@ package org.apache.fluss.utils;
 
 import org.apache.fluss.config.AutoPartitionTimeUnit;
 import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.metadata.PartitionSpec;
 import org.apache.fluss.metadata.ResolvedPartitionSpec;
@@ -31,6 +32,7 @@ import org.apache.fluss.types.DataTypeRoot;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -43,6 +45,7 @@ import static org.apache.fluss.record.TestData.DATA1_TABLE_PATH;
 import static org.apache.fluss.record.TestData.DEFAULT_REMOTE_DATA_DIR;
 import static org.apache.fluss.utils.PartitionUtils.convertValueOfType;
 import static org.apache.fluss.utils.PartitionUtils.generateAutoPartition;
+import static org.apache.fluss.utils.PartitionUtils.isPastAutoPartition;
 import static org.apache.fluss.utils.PartitionUtils.validatePartitionSpec;
 import static org.apache.fluss.utils.PartitionUtils.validatePartitionValues;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -166,6 +169,20 @@ class PartitionUtilsTest {
                             autoPartitionTimeUnit);
             assertThat(resolvedPartitionSpec.getPartitionName()).isEqualTo(expected[i]);
         }
+    }
+
+    @Test
+    void testIsPastAutoPartition() {
+        Configuration conf = new Configuration();
+        conf.set(ConfigOptions.TABLE_AUTO_PARTITION_TIME_UNIT, AutoPartitionTimeUnit.DAY);
+        conf.setString(ConfigOptions.TABLE_AUTO_PARTITION_TIMEZONE, "UTC");
+        AutoPartitionStrategy strategy = AutoPartitionStrategy.from(conf);
+
+        Instant now = Instant.parse("2024-01-10T00:00:00Z");
+        assertThat(isPastAutoPartition("20240109", strategy, now)).isTrue();
+        assertThat(isPastAutoPartition("20240110", strategy, now)).isFalse();
+        assertThat(isPastAutoPartition("20240111", strategy, now)).isFalse();
+        assertThat(isPastAutoPartition("2024-01-09", strategy, now)).isFalse();
     }
 
     @Test

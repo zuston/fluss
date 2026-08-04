@@ -265,6 +265,7 @@ When using SET to modify [Storage Options](engine-flink/options.md#storage-optio
 - All [Read Options](engine-flink/options.md#read-options), [Write Options](engine-flink/options.md#write-options), [Lookup Options](engine-flink/options.md#lookup-options) and [Other Options](engine-flink/options.md#other-options) except `bootstrap.servers`.
 - The following [Storage Options](engine-flink/options.md#storage-options):
   - `table.datalake.enabled`: Enable or disable lakehouse storage for the table.
+  - `table.datalake.historical-partition.enabled`: Enable or disable historical partition lookup.
   - `table.datalake.freshness`: Set the data freshness for lakehouse storage.
 
 ```sql title="Flink SQL"
@@ -277,6 +278,7 @@ ALTER TABLE my_table SET ('table.datalake.freshness' = '5min');
 
 **Limits**
 - If lakehouse storage (`table.datalake.enabled`) is already enabled for a table, options with lakehouse format prefixes (e.g., `paimon.*`) cannot be modified again.
+- After changing `table.datalake.historical-partition.enabled`, restart existing lookup jobs that need to look up historical partition data so that their clients load the updated table configuration.
 
 
 ### RESET properties

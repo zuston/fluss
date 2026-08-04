@@ -1202,7 +1202,13 @@ class CoordinatorEventProcessorTest {
         builder.setCustomProperty("custom.key", "custom.value");
         TablePropertyChanges tablePropertyChanges = builder.build();
         metadataManager.alterTableProperties(
-                t1, Collections.emptyList(), tablePropertyChanges, false, null);
+                t1,
+                Collections.emptyList(),
+                tablePropertyChanges,
+                false,
+                null,
+                (currentTable, updatedTable) -> {},
+                (currentTable, updatedTable) -> {});
 
         // get updated table info and verify metadata update request is sent
         TableInfo updatedTableInfo = metadataManager.getTable(t1);

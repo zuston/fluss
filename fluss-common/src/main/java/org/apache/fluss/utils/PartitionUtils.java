@@ -28,8 +28,13 @@ import org.apache.fluss.row.TimestampLtz;
 import org.apache.fluss.row.TimestampNtz;
 import org.apache.fluss.types.DataTypeRoot;
 
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.Year;
+import java.time.YearMonth;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -40,6 +45,8 @@ import static org.apache.fluss.metadata.TablePath.validatePrefix;
 
 /** Utils for partition. */
 public class PartitionUtils {
+
+    public static final String HISTORICAL_PARTITION_VALUE = "__historical__";
 
     public static final List<DataTypeRoot> PARTITION_KEY_SUPPORTED_TYPES =
             Arrays.asList(
@@ -110,6 +117,60 @@ public class PartitionUtils {
     }
 
     /**
+     * Returns whether a valid auto-partition value is earlier than the partition containing {@code
+     * now}.
+     */
+    public static boolean isPastAutoPartition(
+            String partitionTime, AutoPartitionStrategy autoPartitionStrategy, Instant now) {
+        AutoPartitionTimeUnit timeUnit = autoPartitionStrategy.timeUnit();
+        if (!isValidPartitionTime(partitionTime, timeUnit)) {
+            return false;
+        }
+        ZonedDateTime current =
+                ZonedDateTime.ofInstant(now, autoPartitionStrategy.timeZone().toZoneId());
+        String currentPartitionTime = generateAutoPartitionTime(current, 0, timeUnit);
+        return partitionTime.compareTo(currentPartitionTime) < 0;
+    }
+
+    private static boolean isValidPartitionTime(
+            String partitionTime, AutoPartitionTimeUnit timeUnit) {
+        try {
+            switch (timeUnit) {
+                case YEAR:
+                    Year.parse(partitionTime, DateTimeFormatter.ofPattern("uuuu"));
+                    break;
+                case QUARTER:
+                    if (!partitionTime.matches("\\d{4}[1-4]")) {
+                        return false;
+                    }
+                    break;
+                case MONTH:
+                    YearMonth.parse(partitionTime, DateTimeFormatter.ofPattern("uuuuMM"));
+                    break;
+                case DAY:
+                    LocalDate.parse(partitionTime, DateTimeFormatter.BASIC_ISO_DATE);
+                    break;
+                case HOUR:
+                    if (!partitionTime.matches("\\d{10}")) {
+                        return false;
+                    }
+                    LocalDate.parse(
+                            partitionTime.substring(0, 8), DateTimeFormatter.BASIC_ISO_DATE);
+                    int hour = Integer.parseInt(partitionTime.substring(8));
+                    if (hour > 23) {
+                        return false;
+                    }
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unsupported time unit: " + timeUnit);
+            }
+            return true;
+        } catch (DateTimeParseException | NumberFormatException e) {
+            return false;
+        }
+    }
+
+    /**
      * Generate {@link ResolvedPartitionSpec} for auto partition in server. When we auto creating a
      * partition, we need to first generate a {@link ResolvedPartitionSpec}.
      *
@@ -159,6 +220,50 @@ public class PartitionUtils {
 
     private static String getFormattedTime(ZonedDateTime zonedDateTime, String format) {
         return DateTimeFormatter.ofPattern(format).format(zonedDateTime);
+    }
+
+    /** Parses a partition value back to its typed Fluss internal representation. */
+    public static Object parseValueOfType(String value, DataTypeRoot type) {
+        switch (type) {
+            case CHAR:
+            case STRING:
+                return BinaryString.fromString(value);
+            case BOOLEAN:
+                if ("true".equalsIgnoreCase(value)) {
+                    return true;
+                } else if ("false".equalsIgnoreCase(value)) {
+                    return false;
+                }
+                throw new IllegalArgumentException(
+                        "Invalid boolean partition value: '"
+                                + value
+                                + "'. Expected 'true' or 'false'.");
+            case BINARY:
+            case BYTES:
+                return PartitionNameConverters.parseHexString(value);
+            case TINYINT:
+                return Byte.parseByte(value);
+            case SMALLINT:
+                return Short.parseShort(value);
+            case INTEGER:
+                return Integer.parseInt(value);
+            case BIGINT:
+                return Long.parseLong(value);
+            case DATE:
+                return PartitionNameConverters.parseDayString(value);
+            case TIME_WITHOUT_TIME_ZONE:
+                return PartitionNameConverters.parseMilliString(value);
+            case FLOAT:
+                return PartitionNameConverters.parseFloat(value);
+            case DOUBLE:
+                return PartitionNameConverters.parseDouble(value);
+            case TIMESTAMP_WITHOUT_TIME_ZONE:
+                return PartitionNameConverters.parseTimestampNtz(value);
+            case TIMESTAMP_WITH_LOCAL_TIME_ZONE:
+                return PartitionNameConverters.parseTimestampLtz(value);
+            default:
+                throw new IllegalArgumentException("Unsupported DataTypeRoot: " + type);
+        }
     }
 
     public static String convertValueOfType(Object value, DataTypeRoot type) {

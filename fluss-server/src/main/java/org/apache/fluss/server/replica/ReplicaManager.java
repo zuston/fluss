@@ -24,10 +24,12 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.FencedLeaderEpochException;
 import org.apache.fluss.exception.InvalidColumnProjectionException;
 import org.apache.fluss.exception.InvalidCoordinatorException;
+import org.apache.fluss.exception.InvalidPartitionException;
 import org.apache.fluss.exception.InvalidRequiredAcksException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.exception.LogOffsetOutOfRangeException;
 import org.apache.fluss.exception.LogStorageException;
+import org.apache.fluss.exception.NonPrimaryKeyTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.StorageException;
@@ -37,11 +39,13 @@ import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
+import org.apache.fluss.metadata.SchemaInfo;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.metrics.MetricNames;
 import org.apache.fluss.metrics.groups.MetricGroup;
+import org.apache.fluss.plugin.PluginManager;
 import org.apache.fluss.record.KeyRecordBatch;
 import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.record.MemoryLogRecords;
@@ -69,6 +73,7 @@ import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.server.coordinator.CoordinatorContext;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
+import org.apache.fluss.server.entity.LookupDataForBucket;
 import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
 import org.apache.fluss.server.entity.NotifyLakeTableOffsetData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
@@ -138,8 +143,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -148,6 +155,7 @@ import java.util.stream.Stream;
 
 import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
 import static org.apache.fluss.server.TabletManagerBase.getTableInfo;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.fluss.utils.Preconditions.checkState;
@@ -221,6 +229,8 @@ public class ReplicaManager {
 
     private final Clock clock;
 
+    private final HistoricalLakeLookupManager historicalLakeLookupManager;
+
     public ReplicaManager(
             Configuration conf,
             Scheduler scheduler,
@@ -237,7 +247,8 @@ public class ReplicaManager {
             UserMetrics userMetrics,
             Clock clock,
             ExecutorService ioExecutor,
-            LocalDiskManager localDiskManager)
+            LocalDiskManager localDiskManager,
+            @Nullable PluginManager pluginManager)
             throws IOException {
         this(
                 conf,
@@ -263,7 +274,8 @@ public class ReplicaManager {
                         ioExecutor),
                 clock,
                 ioExecutor,
-                localDiskManager);
+                localDiskManager,
+                pluginManager);
     }
 
     @VisibleForTesting
@@ -284,7 +296,8 @@ public class ReplicaManager {
             RemoteLogManager remoteLogManager,
             Clock clock,
             ExecutorService ioExecutor,
-            LocalDiskManager localDiskManager)
+            LocalDiskManager localDiskManager,
+            @Nullable PluginManager pluginManager)
             throws IOException {
         this.conf = conf;
         this.zkClient = zkClient;
@@ -334,6 +347,9 @@ public class ReplicaManager {
         this.userMetrics = userMetrics;
         this.clock = clock;
         this.ioExecutor = ioExecutor;
+        this.historicalLakeLookupManager =
+                new HistoricalLakeLookupManager(conf, pluginManager, serverId, scheduler);
+
         registerMetrics();
     }
 
@@ -507,8 +523,16 @@ public class ReplicaManager {
                 () -> {
                     // check or apply coordinator epoch.
                     validateAndApplyCoordinatorEpoch(coordinatorEpoch, "updateMetadataCache");
-                    metadataCache.updateClusterMetadata(clusterMetadata);
+                    Set<Long> deletedTableIds =
+                            metadataCache.updateClusterMetadata(clusterMetadata);
                     updateReplicaTableConfig(clusterMetadata);
+                    if (!deletedTableIds.isEmpty()) {
+                        ioExecutor.execute(
+                                () ->
+                                        deletedTableIds.forEach(
+                                                historicalLakeLookupManager
+                                                        ::invalidateTableLookuper));
+                    }
                 });
     }
 
@@ -725,6 +749,64 @@ public class ReplicaManager {
         lookups(false, null, null, entriesPerBucket, apiVersion, responseCallback);
     }
 
+    /** Lookup historical lake data for requests that carry original partition names. */
+    public void historicalLookups(
+            List<LookupDataForBucket> lookupData,
+            Consumer<List<LookupResultForBucket>> responseCallback) {
+        if (lookupData.isEmpty()) {
+            responseCallback.accept(Collections.emptyList());
+            return;
+        }
+
+        List<LookupResultForBucket> result =
+                Collections.synchronizedList(new ArrayList<>(lookupData.size()));
+        AtomicInteger remainingLookups = new AtomicInteger(lookupData.size());
+        for (LookupDataForBucket data : lookupData) {
+            CompletableFuture<LookupResultForBucket> lookupFuture;
+            try {
+                Replica replica = getReplicaOrException(data.tableBucket());
+                if (!replica.isKvTable()) {
+                    throw new NonPrimaryKeyTableException(
+                            "Historical lookup is only supported for primary key tables, but "
+                                    + replica.getTablePath()
+                                    + " is not a primary key table.");
+                }
+                if (!isHistoricalPartitionReplica(replica)) {
+                    throw new InvalidPartitionException(
+                            "Historical lookup request must target a historical partition.");
+                }
+                SchemaInfo latestSchemaInfo = replica.getSchemaGetter().getLatestSchemaInfo();
+                lookupFuture =
+                        historicalLakeLookupManager.lookup(
+                                data, replica.getTableInfo(), latestSchemaInfo);
+            } catch (Exception e) {
+                lookupFuture =
+                        CompletableFuture.completedFuture(
+                                new LookupResultForBucket(
+                                        data.tableBucket(),
+                                        null,
+                                        data.originalPartitionName(),
+                                        ApiError.fromThrowable(e)));
+            }
+            lookupFuture.whenComplete(
+                    (bucketResult, error) -> {
+                        if (error == null) {
+                            result.add(bucketResult);
+                        } else {
+                            result.add(
+                                    new LookupResultForBucket(
+                                            data.tableBucket(),
+                                            null,
+                                            data.originalPartitionName(),
+                                            ApiError.fromThrowable(error)));
+                        }
+                        if (remainingLookups.decrementAndGet() == 0) {
+                            responseCallback.accept(result);
+                        }
+                    });
+        }
+    }
+
     /**
      * Lookup with multi key from leader replica of the buckets.
      *
@@ -812,6 +894,12 @@ public class ReplicaManager {
             responseCallback.accept(lookupResultForBucketMap);
         }
         LOG.debug("Lookup from local kv in {}ms", System.currentTimeMillis() - startTime);
+    }
+
+    private boolean isHistoricalPartitionReplica(Replica replica) {
+        String partitionName = replica.getPhysicalTablePath().getPartitionName();
+        return replica.getTableInfo().getPartitionKeys().size() == 1
+                && HISTORICAL_PARTITION_VALUE.equals(partitionName);
     }
 
     /**
@@ -918,6 +1006,7 @@ public class ReplicaManager {
             List<StopReplicaData> stopReplicaDataList,
             Consumer<List<StopReplicaResultForBucket>> responseCallback) {
         List<StopReplicaResultForBucket> result = new ArrayList<>();
+        Set<Long> deletedHistoricalPartitionTableIds = new HashSet<>();
         inLock(
                 replicaStateChangeLock,
                 () -> {
@@ -979,6 +1068,9 @@ public class ReplicaManager {
                                                 errorMessage));
                             } else {
                                 try {
+                                    boolean deletingHistoricalPartition =
+                                            data.isDeleteRemote()
+                                                    && isHistoricalPartitionReplica(replica);
                                     result.add(
                                             stopReplica(
                                                     tb,
@@ -986,6 +1078,9 @@ public class ReplicaManager {
                                                     data.isDeleteRemote(),
                                                     deletedTableIds,
                                                     deletedPartitionIds));
+                                    if (deletingHistoricalPartition) {
+                                        deletedHistoricalPartitionTableIds.add(tb.getTableId());
+                                    }
                                 } catch (Exception e) {
                                     LOG.error(
                                             "Error processing stopReplica operation on hostedReplica {}",
@@ -1006,6 +1101,8 @@ public class ReplicaManager {
                             (id, dir) -> dropEmptyTableOrPartitionDir(dir, id, "table"));
                 });
 
+        deletedHistoricalPartitionTableIds.forEach(
+                historicalLakeLookupManager::invalidateTableLookuper);
         responseCallback.accept(result);
     }
 
@@ -2219,6 +2316,7 @@ public class ReplicaManager {
     public void shutdown() throws InterruptedException {
         // Close the resources for snapshot kv
         kvSnapshotResource.close();
+        historicalLakeLookupManager.close();
         replicaFetcherManager.shutdown();
         delayedWriteManager.shutdown();
         delayedFetchLogManager.shutdown();

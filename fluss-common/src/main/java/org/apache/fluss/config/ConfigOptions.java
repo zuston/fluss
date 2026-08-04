@@ -347,6 +347,21 @@ public class ConfigOptions {
                                     + "The default value is 10.")
                     .withDeprecatedKeys("coordinator.io-pool.size");
 
+    public static final ConfigOption<String> SERVER_IO_TMP_DIR =
+            key("server.io.tmpdir")
+                    .stringType()
+                    .defaultValue(System.getProperty("java.io.tmpdir") + "/fluss")
+                    .withDescription(
+                            "Local directory used by Fluss components to store temporary files.");
+
+    public static final ConfigOption<Integer> SERVER_HISTORICAL_PARTITION_THREAD_POOL_MAX_SIZE =
+            key("server.historical-partition.thread-pool.max-size")
+                    .intType()
+                    .defaultValue(10)
+                    .withDescription(
+                            "The maximum number of threads used for historical partition operations, such as lake lookups and writes. "
+                                    + "Threads are started lazily and released after the keep-alive timeout when idle.");
+
     public static final ConfigOption<Double> SERVER_DATA_DISK_WRITE_LIMIT_RATIO =
             key("server.data-disk.write-limit-ratio")
                     .doubleType()
@@ -971,6 +986,13 @@ public class ConfigOptions {
                     .withDescription(
                             "The number of queued requests allowed for worker threads, before blocking the I/O threads.");
 
+    public static final ConfigOption<Integer> NETTY_SERVER_MAX_QUEUED_HISTORICAL_REQUESTS =
+            key("netty.server.max-queued-historical-requests")
+                    .intType()
+                    .defaultValue(50)
+                    .withDescription(
+                            "The number of historical lookup requests allowed to wait for lake lookup processing before throttling them.");
+
     public static final ConfigOption<Duration> NETTY_CONNECTION_MAX_IDLE_TIME =
             key("netty.connection.max-idle-time")
                     .durationType()
@@ -1560,6 +1582,20 @@ public class ConfigOptions {
                             "Whether enable lakehouse storage for the table. Disabled by default. "
                                     + "When this option is set to ture and the datalake tiering service is up,"
                                     + " the table will be tiered and compacted into datalake format stored on lakehouse storage.");
+
+    public static final ConfigOption<Boolean> TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED =
+            key("table.datalake.historical-partition.enabled")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "Whether to enable historical partition lookup for the table. "
+                                    + "When enabled, the coordinator creates and retains a system partition "
+                                    + "for routing lookups of expired partitions to lake storage. "
+                                    + "Currently, this option only supports auto-partitioned Paimon primary "
+                                    + "key tables with a single partition key. Disabled by default. "
+                                    + "After changing this option, restart existing lookup jobs that need "
+                                    + "to look up historical partition data so that their clients load the "
+                                    + "updated table configuration.");
 
     public static final ConfigOption<DataLakeFormat> TABLE_DATALAKE_FORMAT =
             key("table.datalake.format")

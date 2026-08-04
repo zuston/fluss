@@ -66,6 +66,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 import static org.apache.fluss.utils.PartitionUtils.generateAutoPartition;
 import static org.apache.fluss.utils.PartitionUtils.generateAutoPartitionTime;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -135,7 +136,20 @@ public class AutoPartitionManager implements AutoCloseable {
     }
 
     public void initAutoPartitionTables(List<TableInfo> tableInfos) {
-        tableInfos.forEach(tableInfo -> addAutoPartitionTable(tableInfo, false));
+        tableInfos.forEach(
+                tableInfo -> {
+                    addAutoPartitionTable(tableInfo, false);
+                    if (tableInfo.getTableConfig().isHistoricalPartitionEnabled()) {
+                        // Recover a missing system partition if the Coordinator stopped after the
+                        // table option was persisted but before partition creation completed.
+                        createHistoricalPartition(tableInfo);
+                    } else {
+                        // Clean up an orphan system partition left by an interrupted disable
+                        // operation. The partition list loaded above avoids an unnecessary ZK
+                        // deletion request when no orphan exists.
+                        dropHistoricalPartition(tableInfo);
+                    }
+                });
     }
 
     public void addAutoPartitionTable(TableInfo tableInfo, boolean forceDoAutoPartition) {
@@ -188,6 +202,62 @@ public class AutoPartitionManager implements AutoCloseable {
                     tableInfo.getTablePath(),
                     tableInfo.getTableId());
         }
+    }
+
+    /** Creates the historical system partition if it does not already exist. */
+    void createHistoricalPartition(TableInfo tableInfo) {
+        checkNotClosed();
+        inLock(
+                lock,
+                () -> {
+                    long tableId = tableInfo.getTableId();
+                    TreeMap<String, Set<String>> currentPartitions =
+                            checkNotNull(
+                                    partitionsByTable.get(tableId),
+                                    "Auto partition state does not exist for table " + tableId);
+                    if (!currentPartitions.containsKey(HISTORICAL_PARTITION_VALUE)) {
+                        createPartition(
+                                tableInfo,
+                                new ResolvedPartitionSpec(
+                                        tableInfo.getPartitionKeys(),
+                                        Collections.singletonList(HISTORICAL_PARTITION_VALUE)),
+                                currentPartitions);
+                    }
+                });
+    }
+
+    /** Best-effort deletes the historical system partition if it exists. */
+    void dropHistoricalPartition(TableInfo tableInfo) {
+        checkNotClosed();
+        inLock(
+                lock,
+                () -> {
+                    long tableId = tableInfo.getTableId();
+                    TreeMap<String, Set<String>> currentPartitions = partitionsByTable.get(tableId);
+                    if (currentPartitions != null
+                            && !currentPartitions.containsKey(HISTORICAL_PARTITION_VALUE)) {
+                        return;
+                    }
+                    try {
+                        metadataManager.dropPartition(
+                                tableInfo.getTablePath(),
+                                new ResolvedPartitionSpec(
+                                        tableInfo.getPartitionKeys(),
+                                        Collections.singletonList(HISTORICAL_PARTITION_VALUE)),
+                                true);
+                        if (currentPartitions != null) {
+                            currentPartitions.remove(HISTORICAL_PARTITION_VALUE);
+                        }
+                        LOG.info(
+                                "Deleted historical partition for table [{}].",
+                                tableInfo.getTablePath());
+                    } catch (Exception e) {
+                        LOG.warn(
+                                "Failed to delete historical partition for table [{}].",
+                                tableInfo.getTablePath(),
+                                e);
+                    }
+                });
     }
 
     /**
@@ -339,50 +409,55 @@ public class AutoPartitionManager implements AutoCloseable {
             return;
         }
 
-        TablePath tablePath = tableInfo.getTablePath();
         for (ResolvedPartitionSpec partition : partitionsToPreCreate) {
-            long tableId = tableInfo.getTableId();
-            int replicaFactor = tableInfo.getTableConfig().getReplicationFactor();
-            TabletServerInfo[] servers = metadataCache.getLiveServers();
-            try {
-                Map<Integer, BucketAssignment> bucketAssignments =
-                        generateAssignment(tableInfo.getNumBuckets(), replicaFactor, servers)
-                                .getBucketAssignments();
-                PartitionAssignment partitionAssignment =
-                        new PartitionAssignment(tableInfo.getTableId(), bucketAssignments);
+            createPartition(tableInfo, partition, currentPartitions);
+        }
+    }
 
-                metadataManager.createPartition(
-                        tablePath, tableId, partitionAssignment, partition, false);
-                // only single partition key table supports automatic creation of partitions
-                currentPartitions.put(partition.getPartitionName(), null);
-                LOG.info(
-                        "Auto partitioning created partition {} for table [{}].",
-                        partition,
-                        tablePath);
-            } catch (PartitionAlreadyExistsException e) {
-                LOG.info(
-                        "Auto partitioning skip to create partition {} for table [{}] as the partition is exist.",
-                        partition,
-                        tablePath);
-            } catch (TooManyPartitionsException t) {
-                LOG.warn(
-                        "Auto partitioning skip to create partition {} for table [{}], "
-                                + "because exceed the maximum number of partitions.",
-                        partition,
-                        tablePath);
-            } catch (TooManyBucketsException t) {
-                LOG.warn(
-                        "Auto partitioning skip to create partition {} for table [{}], "
-                                + "because exceed the maximum number of buckets.",
-                        partition,
-                        tablePath);
-            } catch (Exception e) {
-                LOG.error(
-                        "Auto partitioning failed to create partition {} for table [{}].",
-                        partition,
-                        tablePath,
-                        e);
-            }
+    private void createPartition(
+            TableInfo tableInfo,
+            ResolvedPartitionSpec partition,
+            TreeMap<String, Set<String>> currentPartitions) {
+        TablePath tablePath = tableInfo.getTablePath();
+        long tableId = tableInfo.getTableId();
+        int replicaFactor = tableInfo.getTableConfig().getReplicationFactor();
+        TabletServerInfo[] servers = metadataCache.getLiveServers();
+        try {
+            Map<Integer, BucketAssignment> bucketAssignments =
+                    generateAssignment(tableInfo.getNumBuckets(), replicaFactor, servers)
+                            .getBucketAssignments();
+            PartitionAssignment partitionAssignment =
+                    new PartitionAssignment(tableInfo.getTableId(), bucketAssignments);
+
+            metadataManager.createPartition(
+                    tablePath, tableId, partitionAssignment, partition, false);
+            currentPartitions.put(partition.getPartitionName(), null);
+            LOG.info(
+                    "Auto partitioning created partition {} for table [{}].", partition, tablePath);
+        } catch (PartitionAlreadyExistsException e) {
+            currentPartitions.put(partition.getPartitionName(), null);
+            LOG.info(
+                    "Auto partitioning skip to create partition {} for table [{}] as the partition is exist.",
+                    partition,
+                    tablePath);
+        } catch (TooManyPartitionsException t) {
+            LOG.warn(
+                    "Auto partitioning skip to create partition {} for table [{}], "
+                            + "because exceed the maximum number of partitions.",
+                    partition,
+                    tablePath);
+        } catch (TooManyBucketsException t) {
+            LOG.warn(
+                    "Auto partitioning skip to create partition {} for table [{}], "
+                            + "because exceed the maximum number of buckets.",
+                    partition,
+                    tablePath);
+        } catch (Exception e) {
+            LOG.error(
+                    "Auto partitioning failed to create partition {} for table [{}].",
+                    partition,
+                    tablePath,
+                    e);
         }
     }
 
@@ -447,7 +522,11 @@ public class AutoPartitionManager implements AutoCloseable {
                 currentPartitions.headMap(lastRetainPartitionTime).entrySet().iterator();
         while (iterator.hasNext()) {
             Map.Entry<String, Set<String>> entry = iterator.next();
-
+            // Historical system partitions are managed explicitly by table configuration changes
+            // and Coordinator recovery, never by normal retention cleanup.
+            if (HISTORICAL_PARTITION_VALUE.equals(entry.getKey())) {
+                continue;
+            }
             Iterator<String> dropIterator;
             if (entry.getValue() == null) {
                 dropIterator = new HashSet<>(Collections.singleton(entry.getKey())).iterator();
@@ -455,9 +534,9 @@ public class AutoPartitionManager implements AutoCloseable {
                 dropIterator = entry.getValue().iterator();
             }
 
+            boolean deletionFailed = false;
             while (dropIterator.hasNext()) {
                 String partitionName = dropIterator.next();
-                // drop the partition
                 try {
                     metadataManager.dropPartition(
                             tablePath,
@@ -468,16 +547,24 @@ public class AutoPartitionManager implements AutoCloseable {
                             "Auto partitioning skip to delete partition {} for table [{}] as the partition is not exist.",
                             partitionName,
                             tablePath);
+                } catch (Exception e) {
+                    LOG.warn(
+                            "Auto partitioning failed to delete partition {} for table [{}].",
+                            partitionName,
+                            tablePath,
+                            e);
+                    deletionFailed = true;
+                    continue;
                 }
-
-                // only remove when zk success, this reflects to the partitionsByTable
                 dropIterator.remove();
                 LOG.info(
                         "Auto partitioning deleted partition {} for table [{}].",
                         partitionName,
                         tablePath);
             }
-            iterator.remove();
+            if (!deletionFailed) {
+                iterator.remove();
+            }
         }
     }
 

@@ -89,6 +89,11 @@ public class TableConfig {
         return config.get(ConfigOptions.TABLE_DATALAKE_ENABLED);
     }
 
+    /** Whether historical partition lookup is enabled. */
+    public boolean isHistoricalPartitionEnabled() {
+        return config.get(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED);
+    }
+
     /**
      * Return the data lake format of the table. It'll be the datalake format configured in Fluss
      * whiling creating the table. Return empty if no datalake format configured while creating.

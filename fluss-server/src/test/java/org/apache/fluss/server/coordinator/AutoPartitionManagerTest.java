@@ -61,6 +61,7 @@ import java.util.stream.Stream;
 
 import static org.apache.fluss.metadata.ResolvedPartitionSpec.fromPartitionName;
 import static org.apache.fluss.server.utils.TableAssignmentUtils.generateAssignment;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test for {@link AutoPartitionManager}. */
@@ -566,6 +567,45 @@ class AutoPartitionManagerTest {
         assertThat(partitionsNum).isEqualTo(3);
     }
 
+    @Test
+    void testHistoricalPartitionLifecycle() throws Exception {
+        ZonedDateTime startTime =
+                LocalDateTime.parse("2024-09-10T00:00:00").atZone(ZoneId.systemDefault());
+        ManualClock clock = new ManualClock(startTime.toInstant().toEpochMilli());
+        ManuallyTriggeredScheduledExecutorService periodicExecutor =
+                new ManuallyTriggeredScheduledExecutorService();
+        AutoPartitionManager autoPartitionManager =
+                new AutoPartitionManager(
+                        new TestingServerMetadataCache(3),
+                        metadataManager,
+                        new Configuration(),
+                        clock,
+                        periodicExecutor);
+        autoPartitionManager.start();
+
+        TableInfo table = createPartitionedTable(2, 0, AutoPartitionTimeUnit.HOUR);
+        TableInfo enabledTable = createUpdatedHistoricalPartitionEnabledTableInfo(table, true);
+        TablePath tablePath = table.getTablePath();
+        autoPartitionManager.addAutoPartitionTable(enabledTable, true);
+        autoPartitionManager.createHistoricalPartition(enabledTable);
+
+        Map<String, PartitionRegistration> partitions =
+                zookeeperClient.getPartitionRegistrations(tablePath);
+        assertThat(partitions.keySet()).contains(HISTORICAL_PARTITION_VALUE);
+
+        createPartition(enabledTable, "2024090900", autoPartitionManager);
+        periodicExecutor.triggerNonPeriodicScheduledTasks();
+
+        partitions = zookeeperClient.getPartitionRegistrations(tablePath);
+        assertThat(partitions.keySet()).contains(HISTORICAL_PARTITION_VALUE);
+        assertThat(partitions.keySet()).doesNotContain("2024090900");
+
+        TableInfo disabledTable = createUpdatedHistoricalPartitionEnabledTableInfo(table, false);
+        autoPartitionManager.dropHistoricalPartition(disabledTable);
+        assertThat(zookeeperClient.getPartitionRegistrations(tablePath).keySet())
+                .doesNotContain(HISTORICAL_PARTITION_VALUE);
+    }
+
     private static class TestParams {
         final AutoPartitionTimeUnit timeUnit;
         final boolean multiplePartitionKeys;
@@ -723,6 +763,30 @@ class AutoPartitionManagerTest {
         }
     }
 
+    private void createPartition(
+            TableInfo tableInfo, String partitionName, AutoPartitionManager autoPartitionManager)
+            throws Exception {
+        Map<Integer, BucketAssignment> bucketAssignments =
+                generateAssignment(
+                                tableInfo.getNumBuckets(),
+                                tableInfo.getTableConfig().getReplicationFactor(),
+                                new TabletServerInfo[] {
+                                    new TabletServerInfo(0, "rack0"),
+                                    new TabletServerInfo(1, "rack1"),
+                                    new TabletServerInfo(2, "rack2")
+                                })
+                        .getBucketAssignments();
+        PartitionAssignment partitionAssignment =
+                new PartitionAssignment(tableInfo.getTableId(), bucketAssignments);
+        metadataManager.createPartition(
+                tableInfo.getTablePath(),
+                tableInfo.getTableId(),
+                partitionAssignment,
+                fromPartitionName(tableInfo.getPartitionKeys(), partitionName),
+                false);
+        autoPartitionManager.addPartition(tableInfo.getTableId(), partitionName);
+    }
+
     private TableInfo createPartitionedTable(
             int partitionRetentionNum, int partitionPreCreateNum, AutoPartitionTimeUnit timeUnit)
             throws Exception {
@@ -839,5 +903,27 @@ class AutoPartitionManagerTest {
                 TableRegistration.newTable(tableId, remoteDataDir, descriptor);
         zookeeperClient.registerTable(tablePath, registration);
         return tableInfo;
+    }
+
+    private TableInfo createUpdatedHistoricalPartitionEnabledTableInfo(
+            TableInfo original, boolean historicalPartitionEnabled) {
+        Configuration newProperties = new Configuration(original.getProperties());
+        newProperties.set(
+                ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED,
+                historicalPartitionEnabled);
+        return new TableInfo(
+                original.getTablePath(),
+                original.getTableId(),
+                original.getSchemaId(),
+                original.getSchema(),
+                original.getBucketKeys(),
+                original.getPartitionKeys(),
+                original.getNumBuckets(),
+                newProperties,
+                original.getCustomProperties(),
+                original.getRemoteDataDir(),
+                original.getComment().orElse(null),
+                original.getCreatedTime(),
+                System.currentTimeMillis());
     }
 }

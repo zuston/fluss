@@ -28,6 +28,7 @@ import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.TooManyBucketsException;
 import org.apache.fluss.metadata.AggFunction;
 import org.apache.fluss.metadata.ChangelogImage;
+import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
@@ -41,6 +42,7 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.AutoPartitionStrategy;
 import org.apache.fluss.utils.StringUtils;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
@@ -116,8 +118,65 @@ public class TableDescriptorValidation {
         checkMergeEngine(tableConf, hasPrimaryKey, schema);
         checkDeleteBehavior(tableConf, hasPrimaryKey);
         checkTieredLog(tableConf);
+        checkHistoricalPartition(tableDescriptor, tableConf);
         checkPartition(tableConf, tableDescriptor.getPartitionKeys(), schema.getRowType());
         checkSystemColumns(schema.getRowType());
+    }
+
+    private static void checkHistoricalPartition(
+            TableDescriptor tableDescriptor, Configuration tableConf) {
+        if (!tableConf.get(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED)) {
+            return;
+        }
+
+        List<String> unmetRequirements = new ArrayList<>();
+        if (!tableConf.get(ConfigOptions.TABLE_AUTO_PARTITION_ENABLED)) {
+            unmetRequirements.add(
+                    String.format(
+                            "'%s' must be set to true",
+                            ConfigOptions.TABLE_AUTO_PARTITION_ENABLED.key()));
+        }
+        if (!tableConf.get(ConfigOptions.TABLE_DATALAKE_ENABLED)) {
+            unmetRequirements.add(
+                    String.format(
+                            "'%s' must be set to true",
+                            ConfigOptions.TABLE_DATALAKE_ENABLED.key()));
+        }
+
+        Optional<DataLakeFormat> dataLakeFormat =
+                tableConf.getOptional(ConfigOptions.TABLE_DATALAKE_FORMAT);
+        if (!dataLakeFormat.isPresent()) {
+            unmetRequirements.add(
+                    String.format(
+                            "'%s' must be set to '%s' (currently not set)",
+                            ConfigOptions.TABLE_DATALAKE_FORMAT.key(), DataLakeFormat.PAIMON));
+        } else if (dataLakeFormat.get() != DataLakeFormat.PAIMON) {
+            unmetRequirements.add(
+                    String.format(
+                            "'%s' must be set to '%s' (currently '%s')",
+                            ConfigOptions.TABLE_DATALAKE_FORMAT.key(),
+                            DataLakeFormat.PAIMON,
+                            dataLakeFormat.get()));
+        }
+        if (!tableDescriptor.hasPrimaryKey()) {
+            unmetRequirements.add("the table must define a primary key");
+        }
+
+        int partitionKeyCount = tableDescriptor.getPartitionKeys().size();
+        if (partitionKeyCount != 1) {
+            unmetRequirements.add(
+                    String.format(
+                            "the table must define exactly one partition key (found %s)",
+                            partitionKeyCount));
+        }
+
+        if (!unmetRequirements.isEmpty()) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "'%s' has unmet requirements: %s.",
+                            ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED.key(),
+                            String.join("; ", unmetRequirements)));
+        }
     }
 
     public static void validateAlterTableProperties(
