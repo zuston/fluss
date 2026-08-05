@@ -48,6 +48,7 @@ import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
 import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_LOG_READ_PREFERENCE;
 import static org.apache.fluss.flink.tiering.source.TieringSourceOptions.POLL_TIERING_TABLE_INTERVAL;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getClientScannerIoTmpDir;
+import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getLakeTieringIoTmpDirs;
 import static org.apache.fluss.rpc.protocol.FetchLogReadPreference.REMOTE_FIRST;
 
 /**
@@ -65,14 +66,17 @@ public class TieringSource<WriteResult>
             new OperatorID(generateOperatorHash());
 
     private final Configuration flussConf;
+    private final Configuration lakeTieringConfig;
     private final LakeTieringFactory<WriteResult, ?> lakeTieringFactory;
     private final long pollTieringTableIntervalMs;
 
     public TieringSource(
             Configuration flussConf,
+            Configuration lakeTieringConfig,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             long pollTieringTableIntervalMs) {
         this.flussConf = flussConf;
+        this.lakeTieringConfig = lakeTieringConfig;
         this.lakeTieringFactory = lakeTieringFactory;
         this.pollTieringTableIntervalMs = pollTieringTableIntervalMs;
     }
@@ -121,7 +125,11 @@ public class TieringSource<WriteResult>
                 getClientScannerIoTmpDir(readerConf, sourceReaderContext.getConfiguration()));
         Connection connection = ConnectionFactory.createConnection(readerConf);
         return new TieringSourceReader<>(
-                elementsQueue, sourceReaderContext, connection, lakeTieringFactory);
+                elementsQueue,
+                sourceReaderContext,
+                connection,
+                lakeTieringFactory,
+                getLakeTieringIoTmpDirs(lakeTieringConfig, sourceReaderContext.getConfiguration()));
     }
 
     /** This follows the operator uid hash generation logic of flink {@link StreamGraphHasherV2}. */
@@ -136,13 +144,17 @@ public class TieringSource<WriteResult>
     public static class Builder<WriteResult> {
 
         private final Configuration flussConf;
+        private final Configuration lakeTieringConfig;
         private final LakeTieringFactory<WriteResult, ?> lakeTieringFactory;
         private long pollTieringTableIntervalMs =
                 POLL_TIERING_TABLE_INTERVAL.defaultValue().toMillis();
 
         public Builder(
-                Configuration flussConf, LakeTieringFactory<WriteResult, ?> lakeTieringFactory) {
+                Configuration flussConf,
+                Configuration lakeTieringConfig,
+                LakeTieringFactory<WriteResult, ?> lakeTieringFactory) {
             this.flussConf = flussConf;
+            this.lakeTieringConfig = lakeTieringConfig;
             this.lakeTieringFactory = lakeTieringFactory;
         }
 
@@ -152,7 +164,8 @@ public class TieringSource<WriteResult>
         }
 
         public TieringSource<WriteResult> build() {
-            return new TieringSource<>(flussConf, lakeTieringFactory, pollTieringTableIntervalMs);
+            return new TieringSource<>(
+                    flussConf, lakeTieringConfig, lakeTieringFactory, pollTieringTableIntervalMs);
         }
     }
 }

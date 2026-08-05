@@ -59,8 +59,15 @@ public final class TieringSourceReader<WriteResult>
                     elementsQueue,
             SourceReaderContext context,
             Connection connection,
-            LakeTieringFactory<WriteResult, ?> lakeTieringFactory) {
-        this(elementsQueue, context, connection, lakeTieringFactory, DEFAULT_POLL_TIMEOUT);
+            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
+            String[] ioTmpDirs) {
+        this(
+                elementsQueue,
+                context,
+                connection,
+                lakeTieringFactory,
+                DEFAULT_POLL_TIMEOUT,
+                ioTmpDirs);
     }
 
     @VisibleForTesting
@@ -71,11 +78,25 @@ public final class TieringSourceReader<WriteResult>
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             Duration pollTimeout) {
+        this(elementsQueue, context, connection, lakeTieringFactory, pollTimeout, new String[0]);
+    }
+
+    @VisibleForTesting
+    TieringSourceReader(
+            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
+                    elementsQueue,
+            SourceReaderContext context,
+            Connection connection,
+            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
+            Duration pollTimeout,
+            String[] ioTmpDirs) {
         super(
                 elementsQueue,
                 new TieringSourceFetcherManager<>(
                         elementsQueue,
-                        () -> new TieringSplitReader<>(connection, lakeTieringFactory, pollTimeout),
+                        () ->
+                                new TieringSplitReader<>(
+                                        connection, lakeTieringFactory, pollTimeout, ioTmpDirs),
                         context.getConfiguration(),
                         (ignore) -> {}),
                 new TableBucketWriteResultEmitter<>(),

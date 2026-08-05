@@ -62,4 +62,15 @@ public interface WriterInitContext {
      * @return the Fluss table info
      */
     TableInfo tableInfo();
+
+    /**
+     * Returns the local directories for temporary IO files, or null if the lake writer should use
+     * its own default.
+     *
+     * @return the local temporary IO directories, or null
+     */
+    @Nullable
+    default String[] ioTmpDirs() {
+        return null;
+    }
 }

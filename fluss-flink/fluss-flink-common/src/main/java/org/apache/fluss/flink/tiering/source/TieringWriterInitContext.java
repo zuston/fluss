@@ -31,16 +31,27 @@ public class TieringWriterInitContext implements WriterInitContext {
     private final TableBucket tableBucket;
     @Nullable private final String partition;
     private final TableInfo tableInfo;
+    @Nullable private final String[] ioTmpDirs;
 
     public TieringWriterInitContext(
             TablePath tablePath,
             TableBucket tableBucket,
             @Nullable String partition,
             TableInfo tableInfo) {
+        this(tablePath, tableBucket, partition, tableInfo, null);
+    }
+
+    public TieringWriterInitContext(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partition,
+            TableInfo tableInfo,
+            @Nullable String[] ioTmpDirs) {
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
         this.partition = partition;
         this.tableInfo = tableInfo;
+        this.ioTmpDirs = ioTmpDirs;
     }
 
     @Override
@@ -62,5 +73,11 @@ public class TieringWriterInitContext implements WriterInitContext {
     @Override
     public TableInfo tableInfo() {
         return tableInfo;
+    }
+
+    @Nullable
+    @Override
+    public String[] ioTmpDirs() {
+        return ioTmpDirs;
     }
 }
