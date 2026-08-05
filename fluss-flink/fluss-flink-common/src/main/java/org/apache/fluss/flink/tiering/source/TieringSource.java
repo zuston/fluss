@@ -48,7 +48,6 @@ import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
 import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_LOG_READ_PREFERENCE;
 import static org.apache.fluss.flink.tiering.source.TieringSourceOptions.POLL_TIERING_TABLE_INTERVAL;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getClientScannerIoTmpDir;
-import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getLakeTieringIoTmpDir;
 import static org.apache.fluss.rpc.protocol.FetchLogReadPreference.REMOTE_FIRST;
 
 /**
@@ -123,11 +122,7 @@ public class TieringSource<WriteResult>
         tieringReaderConf.set(CLIENT_SCANNER_LOG_READ_PREFERENCE, REMOTE_FIRST);
         Connection connection = ConnectionFactory.createConnection(tieringReaderConf);
         return new TieringSourceReader<>(
-                elementsQueue,
-                sourceReaderContext,
-                connection,
-                lakeTieringFactory,
-                getLakeTieringIoTmpDir(flussConf, sourceReaderContext.getConfiguration()));
+                elementsQueue, sourceReaderContext, connection, lakeTieringFactory);
     }
 
     /** This follows the operator uid hash generation logic of flink {@link StreamGraphHasherV2}. */

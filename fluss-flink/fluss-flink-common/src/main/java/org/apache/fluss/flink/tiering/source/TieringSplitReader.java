@@ -106,11 +106,9 @@ public class TieringSplitReader<WriteResult>
 
     private final Set<TieringSplit> currentEmptySplits;
 
-    @Nullable private final String ioTmpDir;
-
     public TieringSplitReader(
             Connection connection, LakeTieringFactory<WriteResult, ?> lakeTieringFactory) {
-        this(connection, lakeTieringFactory, DEFAULT_POLL_TIMEOUT, null);
+        this(connection, lakeTieringFactory, DEFAULT_POLL_TIMEOUT);
     }
 
     @VisibleForTesting
@@ -118,15 +116,6 @@ public class TieringSplitReader<WriteResult>
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             Duration pollTimeout) {
-        this(connection, lakeTieringFactory, pollTimeout, null);
-    }
-
-    @VisibleForTesting
-    protected TieringSplitReader(
-            Connection connection,
-            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
-            Duration pollTimeout,
-            @Nullable String ioTmpDir) {
         this.lakeTieringFactory = lakeTieringFactory;
         // owned by TieringSourceReader
         this.connection = connection;
@@ -140,7 +129,6 @@ public class TieringSplitReader<WriteResult>
         this.currentPendingSnapshotSplits = new ArrayDeque<>();
         this.reachTieringMaxDurationTables = new HashSet<>();
         this.pollTimeout = pollTimeout;
-        this.ioTmpDir = ioTmpDir;
     }
 
     @Override
@@ -432,8 +420,7 @@ public class TieringSplitReader<WriteResult>
                                     currentTablePath,
                                     bucket,
                                     partitionName,
-                                    currentTable.getTableInfo(),
-                                    ioTmpDir));
+                                    currentTable.getTableInfo()));
             lakeWriters.put(bucket, lakeWriter);
         }
         return lakeWriter;

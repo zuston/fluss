@@ -64,8 +64,7 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult> {
                                 fileStoreTable,
                                 writerInitContext.tableBucket(),
                                 writerInitContext.partition(),
-                                partitionKeys,
-                                writerInitContext.ioTmpDir());
+                                partitionKeys);
     }
 
     @Override

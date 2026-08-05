@@ -34,8 +34,6 @@ import org.apache.flink.connector.base.source.reader.synchronization.FutureCompl
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nullable;
-
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
@@ -62,23 +60,7 @@ public final class TieringSourceReader<WriteResult>
             SourceReaderContext context,
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory) {
-        this(elementsQueue, context, connection, lakeTieringFactory, (String) null);
-    }
-
-    public TieringSourceReader(
-            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
-                    elementsQueue,
-            SourceReaderContext context,
-            Connection connection,
-            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
-            @Nullable String ioTmpDir) {
-        this(
-                elementsQueue,
-                context,
-                connection,
-                lakeTieringFactory,
-                DEFAULT_POLL_TIMEOUT,
-                ioTmpDir);
+        this(elementsQueue, context, connection, lakeTieringFactory, DEFAULT_POLL_TIMEOUT);
     }
 
     @VisibleForTesting
@@ -89,25 +71,11 @@ public final class TieringSourceReader<WriteResult>
             Connection connection,
             LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
             Duration pollTimeout) {
-        this(elementsQueue, context, connection, lakeTieringFactory, pollTimeout, null);
-    }
-
-    @VisibleForTesting
-    TieringSourceReader(
-            FutureCompletingBlockingQueue<RecordsWithSplitIds<TableBucketWriteResult<WriteResult>>>
-                    elementsQueue,
-            SourceReaderContext context,
-            Connection connection,
-            LakeTieringFactory<WriteResult, ?> lakeTieringFactory,
-            Duration pollTimeout,
-            @Nullable String ioTmpDir) {
         super(
                 elementsQueue,
                 new TieringSourceFetcherManager<>(
                         elementsQueue,
-                        () ->
-                                new TieringSplitReader<>(
-                                        connection, lakeTieringFactory, pollTimeout, ioTmpDir),
+                        () -> new TieringSplitReader<>(connection, lakeTieringFactory, pollTimeout),
                         context.getConfiguration(),
                         (ignore) -> {}),
                 new TableBucketWriteResultEmitter<>(),
