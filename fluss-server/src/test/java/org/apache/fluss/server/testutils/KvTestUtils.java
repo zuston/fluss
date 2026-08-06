@@ -128,7 +128,7 @@ public class KvTestUtils {
                                         tableBucket.getTableId(),
                                         tableBucket.getBucket(),
                                         snapshotId)),
-                KvSnapshotHandle.create(Collections.emptyList(), Collections.emptyList(), 0),
+                new KvSnapshotHandle(Collections.emptyList(), Collections.emptyList(), 0),
                 0,
                 null,
                 null);

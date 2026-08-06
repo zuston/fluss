@@ -162,8 +162,7 @@ class KvSnapshotDataDownloaderTest {
                             handles.get(i), String.format("private-%d-%d", remoteHandleId, i)));
         }
 
-        KvSnapshotHandle kvSnapshotHandle =
-                KvSnapshotHandle.create(sharedStates, privateStates, -1);
+        KvSnapshotHandle kvSnapshotHandle = new KvSnapshotHandle(sharedStates, privateStates, -1);
 
         return new KvSnapshotDownloadSpec(kvSnapshotHandle, dstPath);
     }

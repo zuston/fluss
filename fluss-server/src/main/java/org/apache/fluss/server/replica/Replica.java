@@ -815,7 +815,7 @@ public final class Replica {
         try {
             kvSnapshotDataDownloader.transferAllDataToDirectory(downloadSpec, closeableRegistry);
         } catch (Exception e) {
-            if (CompletedSnapshot.isSnapshotDataNotExists(e)) {
+            if (e.getMessage().contains(CompletedSnapshot.SNAPSHOT_DATA_NOT_EXISTS_ERROR_MESSAGE)) {
                 try {
                     snapshotContext.handleSnapshotBroken(completedSnapshot);
                 } catch (Exception t) {

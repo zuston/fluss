@@ -221,7 +221,7 @@ public class RocksIncrementalSnapshot implements AutoCloseable {
                 completed = true;
                 // We make the 'sstFiles' as the 'shared' in KvSnapshotHandle,
                 final KvSnapshotHandle kvSnapshotHandle =
-                        KvSnapshotHandle.create(sstFiles, miscFiles, snapshotIncrementalSize);
+                        new KvSnapshotHandle(sstFiles, miscFiles, snapshotIncrementalSize);
                 return new SnapshotResult(
                         kvSnapshotHandle, snapshotLocation.getSnapshotDirectory(), tabletState);
             } finally {

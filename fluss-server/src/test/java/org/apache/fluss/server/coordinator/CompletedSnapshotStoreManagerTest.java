@@ -186,20 +186,6 @@ class CompletedSnapshotStoreManagerTest {
 
     @Test
     void testMetadataInconsistencyWithMetadataNotExistsException() throws Exception {
-        verifyMissingSnapshotMetadataIsCleanedUp(
-                new FileNotFoundException(
-                        CompletedSnapshot.SNAPSHOT_DATA_NOT_EXISTS_ERROR_MESSAGE));
-    }
-
-    @Test
-    void testMetadataInconsistencyWithHadoopFileDoesNotExistException() throws Exception {
-        verifyMissingSnapshotMetadataIsCleanedUp(
-                new IOException(
-                        "Failed to open snapshot metadata.",
-                        new IOException("File does not exist: /remote/snapshot/_METADATA")));
-    }
-
-    private void verifyMissingSnapshotMetadataIsCleanedUp(IOException exception) throws Exception {
         // setup test data with mixed valid and invalid snapshots
         TableBucket tableBucket = new TableBucket(1, 1);
         CompletedSnapshot validSnapshot =
@@ -210,7 +196,7 @@ class CompletedSnapshotStoreManagerTest {
         CompletedSnapshot invalidSnapshot =
                 KvTestUtils.mockCompletedSnapshot(tempDir, tableBucket, 2L);
         TestingCompletedSnapshotHandle invalidSnapshotHandle =
-                new TestingBrokenCompletedSnapshotHandle(invalidSnapshot, exception);
+                new TestingCompletedSnapshotHandleWithFileNotFound(invalidSnapshot);
 
         // create CompletedSnapshotHandleStore with real implementations
         CompletedSnapshotHandleStore completedSnapshotHandleStore =
@@ -234,7 +220,6 @@ class CompletedSnapshotStoreManagerTest {
                         DATA1_TABLE_PATH, tableBucket);
         assertThat(completedSnapshotStore.getAllSnapshots()).hasSize(1);
         assertThat(completedSnapshotStore.getAllSnapshots().get(0).getSnapshotID()).isEqualTo(1L);
-        assertThat(completedSnapshotHandleStore.get(tableBucket, 2L)).isEmpty();
     }
 
     private CompletedSnapshotStoreManager createCompletedSnapshotStoreManager(
@@ -296,20 +281,17 @@ class CompletedSnapshotStoreManagerTest {
      * A test-specific implementation of CompletedSnapshotHandle that throws FileNotFoundException
      * with the specific error message expected by CompletedSnapshotStoreManager.
      */
-    private static class TestingBrokenCompletedSnapshotHandle
+    private static class TestingCompletedSnapshotHandleWithFileNotFound
             extends TestingCompletedSnapshotHandle {
 
-        private final IOException exception;
-
-        public TestingBrokenCompletedSnapshotHandle(
-                CompletedSnapshot snapshot, IOException exception) {
+        public TestingCompletedSnapshotHandleWithFileNotFound(CompletedSnapshot snapshot) {
             super(snapshot, false);
-            this.exception = exception;
         }
 
         @Override
         public CompletedSnapshot retrieveCompleteSnapshot() throws IOException {
-            throw exception;
+            throw new FileNotFoundException(
+                    CompletedSnapshot.SNAPSHOT_DATA_NOT_EXISTS_ERROR_MESSAGE);
         }
     }
 

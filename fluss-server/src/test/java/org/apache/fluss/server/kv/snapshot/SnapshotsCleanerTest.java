@@ -118,7 +118,7 @@ class SnapshotsCleanerTest {
         public TestKvSnapshotHandle(
                 List<KvFileHandleAndLocalPath> sharedFileHandles,
                 List<KvFileHandleAndLocalPath> privateFileHandles) {
-            super(sharedFileHandles, privateFileHandles, -1, true);
+            super(sharedFileHandles, privateFileHandles, -1);
         }
 
         @Override
