@@ -254,8 +254,6 @@ public class TabletServer extends ServerBase {
             dynamicConfigManager.register(kvManager);
             // Register localDiskManager for dynamic server.data-disk.write-limit-ratio
             dynamicConfigManager.register(localDiskManager);
-            // Start dynamicConfigManager after all reconfigurable components are registered
-            dynamicConfigManager.startup();
 
             this.authorizer = AuthorizerLoader.createAuthorizer(conf, zkClient, pluginManager);
             if (authorizer != null) {
@@ -301,6 +299,10 @@ public class TabletServer extends ServerBase {
                             ioExecutor,
                             localDiskManager,
                             pluginManager);
+            // Register ReplicaManager for dynamic historical lookup cache configuration.
+            dynamicConfigManager.register(replicaManager);
+            // Start after all reconfigurable components have been registered.
+            dynamicConfigManager.startup();
             replicaManager.startup();
             this.tabletService =
                     new TabletService(

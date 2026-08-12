@@ -201,6 +201,7 @@ public class CoordinatorServer extends ServerBase {
 
             // Register server reconfigurable components
             dynamicConfigManager.register(lakeCatalogDynamicLoader);
+            dynamicConfigManager.register(new HistoricalLookupCacheConfigValidator());
 
             // Register stateless validators for coordinator-side upfront validation
             dynamicConfigManager.registerValidator(new DiskWriteLimitRatioValidator());

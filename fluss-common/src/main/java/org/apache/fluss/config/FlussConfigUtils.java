@@ -23,6 +23,7 @@ import org.apache.fluss.exception.IllegalConfigurationException;
 import org.apache.fluss.fs.FsPath;
 
 import java.lang.reflect.Field;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -202,12 +203,27 @@ public class FlussConfigUtils {
         validMinValue(conf, ConfigOptions.KV_MAX_RETAINED_SNAPSHOTS, 1);
         validMinValue(conf, ConfigOptions.SERVER_IO_POOL_SIZE, 1);
         validMinValue(conf, ConfigOptions.BACKGROUND_THREADS, 1);
+        validMinDuration(
+                conf,
+                ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUPER_CACHE_EXPIRE_AFTER_ACCESS,
+                1);
+        validateHistoricalLookupCacheRatio(conf);
 
         if (conf.get(ConfigOptions.LOG_SEGMENT_FILE_SIZE).getBytes() > Integer.MAX_VALUE) {
             throw new IllegalConfigurationException(
                     String.format(
                             "Invalid configuration for %s, it must be less than or equal %d bytes.",
                             ConfigOptions.LOG_SEGMENT_FILE_SIZE.key(), Integer.MAX_VALUE));
+        }
+    }
+
+    private static void validateHistoricalLookupCacheRatio(Configuration conf) {
+        double historicalLookupCacheMaxRatio =
+                conf.get(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO);
+        if (!(historicalLookupCacheMaxRatio > 0.0 && historicalLookupCacheMaxRatio <= 1.0)) {
+            throw new IllegalConfigurationException(
+                    "Invalid configuration for %s, it must be within (0.0, 1.0].",
+                    ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO.key());
         }
     }
 
@@ -222,6 +238,17 @@ public class FlussConfigUtils {
                     String.format(
                             "Invalid configuration for %s, it must be greater than or equal %d.",
                             option.key(), minValue));
+        }
+    }
+
+    private static void validMinDuration(
+            Configuration conf, ConfigOption<Duration> option, long minMillis) {
+        long millis = conf.get(option).toMillis();
+        if (millis < minMillis) {
+            throw new IllegalConfigurationException(
+                    String.format(
+                            "Invalid configuration for %s, it must be greater than or equal %d ms.",
+                            option.key(), minMillis));
         }
     }
 }

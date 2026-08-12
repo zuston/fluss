@@ -362,6 +362,24 @@ public class ConfigOptions {
                             "The maximum number of threads used for historical partition operations, such as lake lookups and writes. "
                                     + "Threads are started lazily and released after the keep-alive timeout when idle.");
 
+    public static final ConfigOption<Double>
+            SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO =
+                    key("server.historical-partition.lookup-cache.max-disk-ratio")
+                            .doubleType()
+                            .defaultValue(0.10)
+                            .withDescription(
+                                    "The maximum fraction of the total capacity of the volume containing the first available data directory allocated to historical partition lookup caches on a TabletServer. "
+                                            + "Up to ten table lookupers are cached, and each receives one tenth of this capacity. Historical lookup cache files are stored under that data directory; additional data volumes are not used. "
+                                            + "The valid range is (0.0, 1.0].");
+
+    public static final ConfigOption<Duration>
+            SERVER_HISTORICAL_PARTITION_LOOKUPER_CACHE_EXPIRE_AFTER_ACCESS =
+                    key("server.historical-partition.lookuper-cache.expire-after-access")
+                            .durationType()
+                            .defaultValue(Duration.ofHours(3))
+                            .withDescription(
+                                    "The duration after which an idle historical partition table lookuper is removed from the cache.");
+
     public static final ConfigOption<Double> SERVER_DATA_DISK_WRITE_LIMIT_RATIO =
             key("server.data-disk.write-limit-ratio")
                     .doubleType()
