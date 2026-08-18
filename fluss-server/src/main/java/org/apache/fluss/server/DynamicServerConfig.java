@@ -43,9 +43,11 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.fluss.config.ConfigOptions.DATALAKE_FORMAT;
 import static org.apache.fluss.config.ConfigOptions.KV_SHARED_RATE_LIMITER_BYTES_PER_SEC;
+import static org.apache.fluss.config.ConfigOptions.NETTY_SERVER_MAX_QUEUED_HISTORICAL_REQUESTS;
 import static org.apache.fluss.config.ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO;
 import static org.apache.fluss.config.ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUPER_CACHE_EXPIRE_AFTER_ACCESS;
 import static org.apache.fluss.config.ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO;
+import static org.apache.fluss.config.ConfigOptions.SERVER_HISTORICAL_PARTITION_THREAD_POOL_MAX_SIZE;
 import static org.apache.fluss.utils.concurrent.LockUtils.inReadLock;
 import static org.apache.fluss.utils.concurrent.LockUtils.inWriteLock;
 
@@ -66,7 +68,9 @@ class DynamicServerConfig {
                             KV_SHARED_RATE_LIMITER_BYTES_PER_SEC.key(),
                             SERVER_DATA_DISK_WRITE_LIMIT_RATIO.key(),
                             SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO.key(),
-                            SERVER_HISTORICAL_PARTITION_LOOKUPER_CACHE_EXPIRE_AFTER_ACCESS.key()));
+                            SERVER_HISTORICAL_PARTITION_LOOKUPER_CACHE_EXPIRE_AFTER_ACCESS.key(),
+                            SERVER_HISTORICAL_PARTITION_THREAD_POOL_MAX_SIZE.key(),
+                            NETTY_SERVER_MAX_QUEUED_HISTORICAL_REQUESTS.key()));
     private static final Set<String> ALLOWED_CONFIG_PREFIXES = Collections.singleton("datalake.");
 
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
