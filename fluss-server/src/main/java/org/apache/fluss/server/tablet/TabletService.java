@@ -79,6 +79,7 @@ import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
 import org.apache.fluss.server.entity.NotifyLakeTableOffsetData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
 import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
+import org.apache.fluss.server.entity.PutKvDataForBucket;
 import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.log.FetchParams;
@@ -105,6 +106,7 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.hasHistoricalLookup;
+import static org.apache.fluss.rpc.util.CommonRpcMessageUtils.hasHistoricalPut;
 import static org.apache.fluss.security.acl.OperationType.READ;
 import static org.apache.fluss.security.acl.OperationType.WRITE;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
@@ -116,7 +118,6 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyLeade
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifyRemoteLogOffsetsData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getNotifySnapshotOffsetData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getProduceLogData;
-import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getPutKvData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getStopReplicaData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getTableStatsRequestData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.getTargetColumns;
@@ -135,6 +136,7 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeStopReplic
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toHistoricalLookupData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toLookupData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPrefixLookupData;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPutKvDataForBuckets;
 
 /** An RPC Gateway service for tablet server. */
 public final class TabletService extends RpcServiceBase implements TabletServerGateway {
@@ -249,21 +251,35 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     public CompletableFuture<PutKvResponse> putKv(PutKvRequest request) {
         authorizeTable(WRITE, request.getTableId());
 
-        Map<TableBucket, KvRecordBatch> putKvData = getPutKvData(request);
+        List<PutKvDataForBucket> putKvData = toPutKvDataForBuckets(request);
         // Get mergeMode from request, default to DEFAULT if not set
         MergeMode mergeMode =
                 request.hasAggMode()
                         ? MergeMode.fromValue(request.getAggMode())
                         : MergeMode.DEFAULT;
         CompletableFuture<PutKvResponse> response = new CompletableFuture<>();
-        replicaManager.putRecordsToKv(
-                request.getTimeoutMs(),
-                request.getAcks(),
-                putKvData,
-                getTargetColumns(request),
-                mergeMode,
-                currentSession().getApiVersion(),
-                bucketResponse -> response.complete(makePutKvResponse(bucketResponse)));
+        if (hasHistoricalPut(request)) {
+            replicaManager.putHistoricalRecordsToKv(
+                    request.getTimeoutMs(),
+                    request.getAcks(),
+                    putKvData,
+                    getTargetColumns(request),
+                    mergeMode,
+                    currentSession().getApiVersion(),
+                    bucketResponse -> response.complete(makePutKvResponse(bucketResponse)));
+        } else {
+            Map<TableBucket, KvRecordBatch> recordsByBucket = new HashMap<>();
+            putKvData.forEach(
+                    putData -> recordsByBucket.put(putData.tableBucket(), putData.records()));
+            replicaManager.putRecordsToKv(
+                    request.getTimeoutMs(),
+                    request.getAcks(),
+                    recordsByBucket,
+                    getTargetColumns(request),
+                    mergeMode,
+                    currentSession().getApiVersion(),
+                    bucketResponse -> response.complete(makePutKvResponse(bucketResponse)));
+        }
         return response;
     }
 

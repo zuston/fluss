@@ -69,6 +69,22 @@ class RocksDBKvTest {
         }
     }
 
+    @Test
+    void testLiveSstFilesSize(@TempDir Path tempDir) throws Exception {
+        File instanceBasePath = tempDir.toFile();
+        RocksDBResourceContainer container =
+                new RocksDBResourceContainer(new Configuration(), instanceBasePath);
+        RocksDBKvBuilder builder =
+                new RocksDBKvBuilder(instanceBasePath, container, container.getColumnOptions());
+        try (RocksDBKv rocksDBKv = builder.build()) {
+            rocksDBKv.put(new byte[] {1}, new byte[] {2});
+            try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+                rocksDBKv.db.flush(flushOptions);
+            }
+
+            assertThat(rocksDBKv.liveSstFilesSize()).isPositive();
+        }
+    }
     // ------------------------------------------------------------------
     //  Backpressure tests
     // ------------------------------------------------------------------

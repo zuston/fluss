@@ -51,7 +51,8 @@ public enum ApiKeys {
     // Version 2: Understands the STORAGE_BACKPRESSURE_EXCEPTION error code (72) returned when the
     //            KV storage engine rejects a write under pressure; older versions receive the
     //            retriable KV_STORAGE_EXCEPTION instead.
-    PUT_KV(1016, 0, 2, PUBLIC),
+    // Version 3: Supports original_partition_name in requests and responses for historical writes.
+    PUT_KV(1016, 0, 3, PUBLIC),
 
     // Version 0: Uses lake's encoder for primary key encoding (legacy behavior).
     // Version 1: Uses CompactedKeyEncoder for primary key encoding when bucket key differs from

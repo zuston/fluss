@@ -835,6 +835,8 @@ message PbPutKvReqForBucket {
   optional int64 partition_id = 1;
   required int32 bucket_id = 2;
   required bytes records = 3;
+  // The original partition name for historical PK writes. It is unset for normal writes.
+  optional string original_partition_name = 4;
 }
 
 message PbPutKvRespForBucket {
@@ -849,6 +851,8 @@ message PbPutKvRespForBucket {
   // 0 = normal (no pressure), (0,1) = DELAYED zone (normalized L0 ratio)
   // introduced in v1.0
   optional float pressure = 6;
+  // The original partition name for historical PK writes. It is unset for normal writes.
+  optional string original_partition_name = 7;
 }
 
 message PbLookupReqForBucket {
