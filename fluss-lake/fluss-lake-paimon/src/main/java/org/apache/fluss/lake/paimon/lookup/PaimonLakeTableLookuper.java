@@ -23,14 +23,7 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.DiskWriteLockedException;
 import org.apache.fluss.exception.KvStorageException;
 import org.apache.fluss.lake.lakestorage.LakeTableLookuper;
-import org.apache.fluss.lake.paimon.utils.PaimonRowAsFlussRow;
 import org.apache.fluss.metadata.TablePath;
-import org.apache.fluss.row.BinaryRow;
-import org.apache.fluss.row.InternalRow;
-import org.apache.fluss.row.decode.CompactedKeyDecoder;
-import org.apache.fluss.row.encode.RowEncoder;
-import org.apache.fluss.row.encode.ValueEncoder;
-import org.apache.fluss.row.encode.paimon.PaimonKeyEncoder;
 import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.IOUtils;
@@ -43,25 +36,17 @@ import org.apache.paimon.disk.BufferFileReader;
 import org.apache.paimon.disk.BufferFileWriter;
 import org.apache.paimon.disk.FileIOChannel;
 import org.apache.paimon.disk.IOManager;
-import org.apache.paimon.memory.MemorySegment;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.query.LocalTableQuery;
-import org.apache.paimon.table.sink.RowPartitionKeyExtractor;
-import org.apache.paimon.types.DataField;
 
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.ArrayList;
 import java.util.Collections;
-import java.util.List;
 
-import static org.apache.fluss.config.ConfigOptions.KV_FORMAT_VERSION_2;
-import static org.apache.fluss.lake.paimon.PaimonLakeCatalog.SYSTEM_COLUMNS;
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
-import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimonPartition;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
@@ -100,13 +85,8 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
     private final Object initializationLock;
 
     private @Nullable Catalog catalog;
-    private @Nullable FileStoreTable fileStoreTable;
     private @Nullable IOManager ioManager;
-    private @Nullable List<String> trimmedPrimaryKeys;
-
-    // CompactedKeyDecoder contains immutable type metadata and creates all decode state per
-    // invocation, so it can be shared by concurrent lookups.
-    private @Nullable CompactedKeyDecoder compactedKeyDecoder;
+    private @Nullable PaimonLookupRowConverter rowConverter;
 
     private volatile @Nullable PaimonLocalTableQuery localTableQuery;
     // Guarded by initializationLock.
@@ -169,10 +149,8 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
             IOUtils.closeQuietly(ioManager, "Paimon lookup IO manager");
             IOUtils.closeQuietly(catalog, "Paimon catalog");
             localTableQuery = null;
-            compactedKeyDecoder = null;
-            trimmedPrimaryKeys = null;
+            rowConverter = null;
             ioManager = null;
-            fileStoreTable = null;
             catalog = null;
         }
     }
@@ -205,42 +183,22 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
             FileStoreTable newFileStoreTable =
                     withLookupCacheOptions(
                             (FileStoreTable) newCatalog.getTable(toPaimon(tablePath)));
-            if (newFileStoreTable.primaryKeys().isEmpty()) {
-                throw new UnsupportedOperationException(
-                        "Point lookup is only supported for primary-key Paimon tables.");
-            }
-
-            List<String> newTrimmedPrimaryKeys =
-                    Collections.unmodifiableList(
-                            new ArrayList<>(newFileStoreTable.schema().trimmedPrimaryKeys()));
-            CompactedKeyDecoder newCompactedKeyDecoder = null;
-
-            // Legacy/v1 tables and v2 tables with a default bucket key already encode Fluss
-            // lookup keys with Paimon's key encoder. Only v2 tables with a non-default bucket
-            // key use the compacted key encoding and need conversion before querying Paimon.
-            if (tableConfig.getKvFormatVersion().orElse(1) == KV_FORMAT_VERSION_2
-                    && !newFileStoreTable.schema().bucketKeys().equals(newTrimmedPrimaryKeys)) {
-                // Kv-format-v2 tables with a non-default bucket key store Fluss keys using the
-                // compacted encoding to support prefix lookup. Paimon's LocalTableQuery expects
-                // its own BinaryRow encoding, so convert the key at the lake lookup boundary.
-                newCompactedKeyDecoder =
-                        CompactedKeyDecoder.createKeyDecoder(valueRowType, newTrimmedPrimaryKeys);
-            }
+            PaimonLookupRowConverter newRowConverter =
+                    new PaimonLookupRowConverter(
+                            tableConfig, newFileStoreTable.schema(), valueRowType);
 
             newIOManager = createIOManager(ioTmpDir);
             newLocalTableQuery =
                     newFileStoreTable
                             .newLocalTableQuery()
-                            .withValueProjection(businessFieldProjection(newFileStoreTable))
+                            .withValueProjection(newRowConverter.valueProjection())
                             .withIOManager(newIOManager);
 
             PaimonLocalTableQuery newLookupEngine =
                     new PaimonLocalTableQuery(newFileStoreTable, newLocalTableQuery);
             catalog = newCatalog;
-            fileStoreTable = newFileStoreTable;
             ioManager = newIOManager;
-            trimmedPrimaryKeys = newTrimmedPrimaryKeys;
-            compactedKeyDecoder = newCompactedKeyDecoder;
+            rowConverter = newRowConverter;
             // Keep this volatile write last to publish all initialized fields together.
             localTableQuery = newLookupEngine;
             initialized = true;
@@ -263,59 +221,14 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
         return new TrackingIOManager(IOManager.create(ioTmpDir));
     }
 
-    private static int[] businessFieldProjection(FileStoreTable fileStoreTable) {
-        List<DataField> fields = fileStoreTable.schema().logicalRowType().getFields();
-        List<Integer> projectedFields = new ArrayList<>();
-        for (int i = 0; i < fields.size(); i++) {
-            if (!SYSTEM_COLUMNS.containsKey(fields.get(i).name())) {
-                projectedFields.add(i);
-            }
-        }
-
-        int[] projection = new int[projectedFields.size()];
-        for (int i = 0; i < projectedFields.size(); i++) {
-            projection[i] = projectedFields.get(i);
-        }
-        return projection;
-    }
-
-    private org.apache.paimon.data.BinaryRow getPartition(LookupContext context) {
-        // Both generated helpers reuse mutable writers or projections, so keep them confined to
-        // this lookup call.
-        RowPartitionKeyExtractor partitionKeyExtractor =
-                new RowPartitionKeyExtractor(fileStoreTable.schema());
-        org.apache.paimon.data.BinaryRow partition =
-                toPaimonPartition(
-                                context.partitionSpec(),
-                                context.valueRowType(),
-                                fileStoreTable.schema().logicalRowType(),
-                                partitionKeyExtractor::partition)
-                        .copy();
-        return partition;
-    }
-
-    private org.apache.paimon.data.BinaryRow getKey(byte[] key, LookupContext context) {
-        byte[] paimonKey = key;
-        if (compactedKeyDecoder != null) {
-            InternalRow decodedKey = compactedKeyDecoder.decodeKey(key);
-            RowType keyRowType = context.valueRowType().project(trimmedPrimaryKeys);
-            PaimonKeyEncoder paimonKeyEncoder =
-                    new PaimonKeyEncoder(keyRowType, trimmedPrimaryKeys);
-            paimonKey = paimonKeyEncoder.encodeKey(decodedKey);
-        }
-
-        org.apache.paimon.data.BinaryRow keyRow =
-                new org.apache.paimon.data.BinaryRow(trimmedPrimaryKeys.size());
-        keyRow.pointTo(MemorySegment.wrap(paimonKey), 0, paimonKey.length);
-        return keyRow;
-    }
-
     private @Nullable byte[] lookupInternal(byte[] key, LookupContext context) {
         org.apache.paimon.data.InternalRow paimonRow;
         try {
             paimonRow =
                     localTableQuery.lookup(
-                            getPartition(context), context.bucketId(), getKey(key, context));
+                            rowConverter.getPartition(context),
+                            context.bucketId(),
+                            rowConverter.getKey(key, context));
         } catch (IOException e) {
             // Historical Paimon point lookup is part of the Fluss KV lookup path. Expose a
             // persistent I/O failure as a retriable KV error so the existing KV RPC retry
@@ -329,23 +242,7 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
         if (paimonRow == null) {
             return null;
         }
-        return encodeValue(paimonRow, context.schemaId(), context.valueRowType());
-    }
-
-    private byte[] encodeValue(
-            org.apache.paimon.data.InternalRow paimonRow, short schemaId, RowType valueRowType) {
-        PaimonRowAsFlussRow flussRow = new PaimonRowAsFlussRow(paimonRow);
-        InternalRow.FieldGetter[] fieldGetters = InternalRow.createFieldGetters(valueRowType);
-        try (RowEncoder rowEncoder = RowEncoder.create(tableConfig.getKvFormat(), valueRowType)) {
-            rowEncoder.startNewRow();
-            for (int i = 0; i < fieldGetters.length; i++) {
-                rowEncoder.encodeField(i, fieldGetters[i].getFieldOrNull(flussRow));
-            }
-            BinaryRow row = rowEncoder.finishRow();
-            return ValueEncoder.encodeValue(schemaId, row);
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to encode Paimon lookup row as Fluss value.", e);
-        }
+        return rowConverter.encodeValue(paimonRow, context);
     }
 
     /** Tracks creation of Paimon lookup files while delegating all local I/O operations. */

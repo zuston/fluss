@@ -648,12 +648,18 @@ class HistoricalLakeLookupManager implements AutoCloseable {
         return lakeStorage.createLakeTableLookuper(
                 tablePath,
                 new LakeStorage.LookuperContext(
-                        ioTmpDir, tableConfig, cacheSizeBytes, diskWriteGuard));
+                        ioTmpDir,
+                        tableConfig,
+                        clusterConf.get(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE),
+                        cacheSizeBytes,
+                        diskWriteGuard));
     }
 
     private static boolean hasLakeConfigChanged(Configuration currentConf, Configuration newConf) {
         return currentConf.get(ConfigOptions.DATALAKE_FORMAT)
                         != newConf.get(ConfigOptions.DATALAKE_FORMAT)
+                || currentConf.get(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE)
+                        != newConf.get(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE)
                 || !Objects.equals(
                         extractLakeProperties(currentConf), extractLakeProperties(newConf));
     }

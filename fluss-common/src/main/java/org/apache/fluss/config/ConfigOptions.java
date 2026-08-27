@@ -20,6 +20,7 @@ package org.apache.fluss.config;
 import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.PublicEvolving;
 import org.apache.fluss.compression.ArrowCompressionType;
+import org.apache.fluss.lake.lakestorage.LakeStorage.LookupMode;
 import org.apache.fluss.metadata.ChangelogImage;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.DeleteBehavior;
@@ -361,6 +362,17 @@ public class ConfigOptions {
                     .withDescription(
                             "The maximum number of threads used for historical partition operations, such as lake lookups and writes. "
                                     + "Threads are started lazily and released after the keep-alive timeout when idle.");
+
+    public static final ConfigOption<LookupMode> SERVER_HISTORICAL_PARTITION_LOOKUP_MODE =
+            key("server.historical-partition.lookup.mode")
+                    .enumType(LookupMode.class)
+                    .defaultValue(LookupMode.LOCAL)
+                    .withDescription(
+                            "The implementation used for historical partition point lookups. "
+                                    + "LOCAL uses local Paimon lookup files; SCAN scans the latest "
+                                    + "snapshot with a primary-key filter and limit 1. "
+                                    + "This is a Fluss server option, not a Paimon table or catalog option. "
+                                    + "It can be updated dynamically without restarting the server.");
 
     public static final ConfigOption<Double>
             SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO =

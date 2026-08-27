@@ -68,10 +68,17 @@ public interface LakeStorage {
                 "Point lookup is not supported for this lake storage.");
     }
 
+    /** Available historical point lookup implementations. */
+    enum LookupMode {
+        LOCAL,
+        SCAN
+    }
+
     /** Runtime context for creating a lake table lookuper. */
     final class LookuperContext {
         private final String ioTmpDir;
         private final TableConfig tableConfig;
+        private final LookupMode lookupMode;
         private final long lookupCacheMaxDiskBytes;
         private final Runnable diskWriteGuard;
 
@@ -80,16 +87,19 @@ public interface LakeStorage {
          *
          * @param ioTmpDir local directory for temporary files used by the lookuper
          * @param tableConfig configuration of the Fluss table
+         * @param lookupMode implementation to use for historical point lookups
          * @param lookupCacheMaxDiskBytes maximum local lookup cache size in bytes
          * @param diskWriteGuard guard invoked before creating a local lookup cache file
          */
         public LookuperContext(
                 String ioTmpDir,
                 TableConfig tableConfig,
+                LookupMode lookupMode,
                 long lookupCacheMaxDiskBytes,
                 Runnable diskWriteGuard) {
             this.ioTmpDir = checkNotNull(ioTmpDir, "ioTmpDir must not be null.");
             this.tableConfig = checkNotNull(tableConfig, "tableConfig must not be null.");
+            this.lookupMode = checkNotNull(lookupMode, "lookupMode must not be null.");
             checkArgument(
                     lookupCacheMaxDiskBytes > 0, "lookupCacheMaxDiskBytes must be greater than 0.");
             this.lookupCacheMaxDiskBytes = lookupCacheMaxDiskBytes;
@@ -104,6 +114,11 @@ public interface LakeStorage {
         /** Returns the configuration of the Fluss table. */
         public TableConfig tableConfig() {
             return tableConfig;
+        }
+
+        /** Returns the implementation to use for historical point lookups. */
+        public LookupMode lookupMode() {
+            return lookupMode;
         }
 
         /** Returns the maximum local lookup cache size in bytes. */

@@ -37,6 +37,19 @@ datalake.paimon.warehouse: /tmp/paimon
 
 Fluss processes Paimon configurations by removing the `datalake.paimon.` prefix and then use the remaining configuration (without the prefix `datalake.paimon.`) to create the Paimon catalog. Checkout the [Paimon documentation](https://paimon.apache.org/docs/$PAIMON_VERSION_SHORT$/maintenance/configurations/) for more details on the available configurations.
 
+For historical partition point lookups, `server.historical-partition.lookup.mode` defaults to `local`, which builds and caches local Paimon lookup files.
+To scan Paimon directly without building those lookup files, configure:
+
+```yaml
+server.historical-partition.lookup.mode: scan
+```
+
+The scan lookuper plans each request against the latest snapshot, filters by partition, bucket, and primary key, and closes the reader after the first matching row (`limit 1`).
+This is a Fluss cluster-level option, not a Paimon table or catalog option. It is passed through the lookuper context and is not forwarded to Paimon configuration.
+This avoids local lookup-file creation when cache reuse is low, at the cost of planning and reading Paimon data on each request.
+Use `local` to switch back to the local-file lookuper. Scan lookups record latency but do not count as lookup-file downloads.
+The mode can be [updated dynamically](../operations/updating-configs.md) without restarting the server; subsequent lookups use the new implementation while active lookups finish on the old one.
+
 For example, if you want to configure to use Hive catalog, you can configure like following:
 ```yaml
 datalake.format: paimon

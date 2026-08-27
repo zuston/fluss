@@ -22,6 +22,9 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.MemorySize;
 import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.HistoricalPartitionThrottledException;
+import org.apache.fluss.lake.lakestorage.LakeStorage;
+import org.apache.fluss.lake.lakestorage.LakeStorage.LookupMode;
+import org.apache.fluss.lake.lakestorage.LakeStoragePlugin;
 import org.apache.fluss.lake.lakestorage.LakeTableLookuper;
 import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.KvFormat;
@@ -31,6 +34,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
+import org.apache.fluss.plugin.PluginManager;
 import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.entity.LookupDataForBucket;
@@ -42,7 +46,9 @@ import com.github.benmanes.caffeine.cache.Ticker;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 import java.io.File;
 import java.io.RandomAccessFile;
@@ -65,6 +71,11 @@ import static org.apache.fluss.record.TestData.PARTITION_TABLE_ID;
 import static org.apache.fluss.record.TestData.PARTITION_TABLE_INFO;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /** Tests for {@link HistoricalLakeLookupManager}. */
 class HistoricalLakeLookupManagerTest {
@@ -541,6 +552,102 @@ class HistoricalLakeLookupManagerTest {
         assertThat(manager.createdLookupers).hasSize(2);
         assertThat(manager.createdClusterConfigs.get(1).toMap())
                 .containsEntry("datalake.paimon.warehouse", "new-warehouse");
+    }
+
+    @ParameterizedTest
+    @EnumSource(LookupMode.class)
+    void testPassesLookupModeThroughContextOnly(LookupMode mode) throws Exception {
+        Configuration configuration = conf(1);
+        configuration.set(ConfigOptions.DATALAKE_FORMAT, DataLakeFormat.PAIMON);
+        configuration.setString("datalake.paimon.warehouse", "warehouse");
+        configuration.set(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE, mode);
+        PluginManager pluginManager = mock(PluginManager.class);
+        LakeStoragePlugin plugin = mock(LakeStoragePlugin.class);
+        LakeStorage lakeStorage = mock(LakeStorage.class);
+        when(pluginManager.load(LakeStoragePlugin.class))
+                .thenReturn(Collections.singletonList(plugin).iterator());
+        when(plugin.identifier()).thenReturn("paimon");
+        when(plugin.createLakeStorage(any(Configuration.class))).thenReturn(lakeStorage);
+        when(lakeStorage.createLakeTableLookuper(any(), any()))
+                .thenReturn(mock(LakeTableLookuper.class));
+
+        TablePath tablePath = PARTITION_TABLE_INFO.getTablePath();
+        try (HistoricalLakeLookupManager manager =
+                        new HistoricalLakeLookupManager(
+                                configuration,
+                                pluginManager,
+                                new ManualExecutor(),
+                                ioTmpDir,
+                                DATA_DIR_VOLUME_BYTES,
+                                Ticker.systemTicker(),
+                                Scheduler.disabledScheduler(),
+                                NO_OP_DISK_WRITE_GUARD);
+                LakeTableLookuper lookuper =
+                        manager.createLakeTableLookuper(
+                                tablePath,
+                                ioTmpDir.getAbsolutePath(),
+                                PARTITION_TABLE_INFO.getTableConfig(),
+                                1024L,
+                                configuration)) {
+            assertThat(lookuper).isNotNull();
+            ArgumentCaptor<LakeStorage.LookuperContext> context =
+                    ArgumentCaptor.forClass(LakeStorage.LookuperContext.class);
+            verify(lakeStorage).createLakeTableLookuper(eq(tablePath), context.capture());
+            assertThat(context.getValue().lookupMode()).isEqualTo(mode);
+
+            ArgumentCaptor<Configuration> lakeConfig = ArgumentCaptor.forClass(Configuration.class);
+            verify(plugin).createLakeStorage(lakeConfig.capture());
+            assertThat(lakeConfig.getValue().toMap())
+                    .isEqualTo(Collections.singletonMap("warehouse", "warehouse"));
+        }
+    }
+
+    @Test
+    void testReconfiguresLookupModeAfterActiveLookupFinishes() throws Exception {
+        Configuration initialConf = conf(1);
+        ManualExecutor executor = new ManualExecutor();
+        TestingHistoricalLakeLookupManager manager =
+                new TestingHistoricalLakeLookupManager(initialConf, executor);
+        manager.startup(NO_OP_SCHEDULER);
+        lookupAndRun(manager, executor, PARTITION_TABLE_INFO);
+        TestingLakeTableLookuper initialLookuper = manager.createdLookupers.get(0);
+
+        Configuration scanConf = new Configuration(initialConf);
+        scanConf.set(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE, LookupMode.SCAN);
+        CompletableFuture<LookupResultForBucket> activeLookup =
+                manager.lookup(
+                        lookupData(HISTORICAL_BUCKET),
+                        PARTITION_TABLE_INFO,
+                        PARTITION_TABLE_INFO.getSchemaInfo(),
+                        (nanos, downloaded) -> {
+                            manager.reconfigure(scanConf);
+                            assertThat(initialLookuper.closed).isFalse();
+                        });
+        executor.runNext();
+        assertThat(activeLookup.get(1, TimeUnit.SECONDS).failed()).isFalse();
+        assertThat(initialLookuper.closed).isTrue();
+        assertThat(manager.cachedTableCount()).isZero();
+
+        lookupAndRun(manager, executor, PARTITION_TABLE_INFO);
+        assertThat(manager.createdLookupers).hasSize(2);
+        assertThat(
+                        manager.createdClusterConfigs
+                                .get(1)
+                                .get(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE))
+                .isEqualTo(LookupMode.SCAN);
+        TestingLakeTableLookuper scanLookuper = manager.createdLookupers.get(1);
+        manager.reconfigure(new Configuration(scanConf));
+        assertThat(scanLookuper.closed).isFalse();
+
+        manager.reconfigure(initialConf);
+        assertThat(scanLookuper.closed).isTrue();
+        lookupAndRun(manager, executor, PARTITION_TABLE_INFO);
+        assertThat(manager.createdLookupers).hasSize(3);
+        assertThat(
+                        manager.createdClusterConfigs
+                                .get(2)
+                                .get(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE))
+                .isEqualTo(LookupMode.LOCAL);
     }
 
     private HistoricalLakeLookupManager createManager(

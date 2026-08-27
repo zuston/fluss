@@ -280,13 +280,39 @@ public class DynamicConfigChangeTest {
                         new AlterConfig(
                                 ConfigOptions.NETTY_SERVER_MAX_QUEUED_HISTORICAL_REQUESTS.key(),
                                 "60",
+                                AlterConfigOpType.SET),
+                        new AlterConfig(
+                                ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE.key(),
+                                "scan",
                                 AlterConfigOpType.SET)));
 
         assertThat(zookeeperClient.fetchEntityConfig())
                 .containsEntry(
                         ConfigOptions.SERVER_HISTORICAL_PARTITION_THREAD_POOL_MAX_SIZE.key(), "12")
                 .containsEntry(
-                        ConfigOptions.NETTY_SERVER_MAX_QUEUED_HISTORICAL_REQUESTS.key(), "60");
+                        ConfigOptions.NETTY_SERVER_MAX_QUEUED_HISTORICAL_REQUESTS.key(), "60")
+                .containsEntry(ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_MODE.key(), "scan");
+    }
+
+    @Test
+    void testRejectsInvalidHistoricalLookupMode() throws Exception {
+        DynamicConfigManager dynamicConfigManager =
+                new DynamicConfigManager(zookeeperClient, new Configuration(), true);
+        dynamicConfigManager.startup();
+
+        assertThatThrownBy(
+                        () ->
+                                dynamicConfigManager.alterConfigs(
+                                        Collections.singletonList(
+                                                new AlterConfig(
+                                                        ConfigOptions
+                                                                .SERVER_HISTORICAL_PARTITION_LOOKUP_MODE
+                                                                .key(),
+                                                        "unknown",
+                                                        AlterConfigOpType.SET))))
+                .isInstanceOf(ConfigException.class)
+                .hasMessageContaining(
+                        "Cannot parse 'unknown' as LookupMode for config 'server.historical-partition.lookup.mode'");
     }
 
     @Test
