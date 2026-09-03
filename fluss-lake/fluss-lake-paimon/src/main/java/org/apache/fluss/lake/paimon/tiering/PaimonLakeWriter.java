@@ -27,7 +27,6 @@ import org.apache.fluss.record.LogRecord;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.table.FileStoreTable;
-import org.apache.paimon.table.sink.CommitMessage;
 
 import java.io.IOException;
 import java.util.Collections;
@@ -35,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
+import static org.apache.fluss.utils.PartitionUtils.HISTORICAL_PARTITION_VALUE;
 
 /** Implementation of {@link LakeWriter} for Paimon. */
 public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult> {
@@ -52,6 +52,8 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult> {
                         writerInitContext.tableInfo().getTableConfig().isDataLakeAutoCompaction());
 
         List<String> partitionKeys = fileStoreTable.partitionKeys();
+        boolean historicalPartition =
+                HISTORICAL_PARTITION_VALUE.equals(writerInitContext.partition());
 
         this.recordWriter =
                 fileStoreTable.primaryKeys().isEmpty()
@@ -59,13 +61,15 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult> {
                                 fileStoreTable,
                                 writerInitContext.tableBucket(),
                                 writerInitContext.partition(),
-                                partitionKeys)
+                                partitionKeys,
+                                historicalPartition)
                         : new MergeTreeWriter(
                                 fileStoreTable,
                                 writerInitContext.tableBucket(),
                                 writerInitContext.partition(),
                                 partitionKeys,
-                                writerInitContext.ioTmpDirs());
+                                writerInitContext.ioTmpDirs(),
+                                historicalPartition);
     }
 
     @Override
@@ -79,13 +83,11 @@ public class PaimonLakeWriter implements LakeWriter<PaimonWriteResult> {
 
     @Override
     public PaimonWriteResult complete() throws IOException {
-        CommitMessage commitMessage;
         try {
-            commitMessage = recordWriter.complete();
+            return new PaimonWriteResult(recordWriter.complete());
         } catch (Exception e) {
             throw new IOException("Failed to complete Paimon write.", e);
         }
-        return new PaimonWriteResult(commitMessage);
     }
 
     @Override

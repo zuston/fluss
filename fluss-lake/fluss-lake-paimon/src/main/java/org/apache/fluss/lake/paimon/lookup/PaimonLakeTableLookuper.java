@@ -45,6 +45,7 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Collections;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
 import static org.apache.fluss.utils.Preconditions.checkArgument;
@@ -69,8 +70,13 @@ import static org.apache.fluss.utils.Preconditions.checkNotNull;
  * slow path. A version-aware lookup engine uses Paimon 1.3's query monitor or Paimon 2.0's internal
  * bucket locks as appropriate.
  *
+ * <p>An explicit refresh request is applied during the next lookup initialization. It rescans every
+ * registered partition-bucket and updates its file set in place. Paimon keeps lookup files for data
+ * files that remain active and lazily downloads lookup files only for newly added data files.
+ *
  * <p>Close is expected only after the owner has drained active lookups. It is synchronized with
- * lazy initialization, but deliberately does not add a lifecycle lock to every lookup.
+ * lazy initialization and file-set updates, but deliberately does not add a lifecycle lock to every
+ * lookup.
  */
 public class PaimonLakeTableLookuper implements LakeTableLookuper {
 
@@ -83,6 +89,8 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
 
     private final ThreadLocal<Boolean> lookupFileDownloaded;
     private final Object initializationLock;
+    // Remains non-zero until a refresh completes without observing another request.
+    private final AtomicLong pendingRefreshRequests;
 
     private @Nullable Catalog catalog;
     private @Nullable IOManager ioManager;
@@ -110,6 +118,7 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
         this.diskWriteGuard = checkNotNull(diskWriteGuard, "diskWriteGuard must not be null.");
         this.lookupFileDownloaded = new ThreadLocal<>();
         this.initializationLock = new Object();
+        this.pendingRefreshRequests = new AtomicLong();
     }
 
     @Override
@@ -117,7 +126,7 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
         checkNotNull(key, "key must not be null.");
         checkNotNull(context, "context must not be null.");
         checkNotClosed();
-        ensureInitialized(context.valueRowType());
+        initialize(context.valueRowType());
 
         lookupFileDownloaded.set(false);
         long lookupStartNanos = System.nanoTime();
@@ -136,6 +145,12 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
             context.lookupMetricRecorder()
                     .recordLookup(System.nanoTime() - lookupStartNanos, fileDownloaded);
         }
+    }
+
+    @Override
+    public void requestRefresh() {
+        checkNotClosed();
+        pendingRefreshRequests.incrementAndGet();
     }
 
     @Override
@@ -161,17 +176,27 @@ public class PaimonLakeTableLookuper implements LakeTableLookuper {
         }
     }
 
-    private void ensureInitialized(RowType valueRowType) throws Exception {
-        if (localTableQuery == null) {
+    private void initialize(RowType valueRowType) throws Exception {
+        if (localTableQuery == null || pendingRefreshRequests.get() != 0) {
             synchronized (initializationLock) {
                 if (localTableQuery == null) {
-                    initialize(valueRowType);
+                    initializeLookupState(valueRowType);
+                }
+                long observedRefreshRequests;
+                while ((observedRefreshRequests = pendingRefreshRequests.get()) != 0) {
+                    // A single scan handles all currently pending refresh requests.
+                    checkNotNull(localTableQuery).refreshFilesFromLatestSnapshot();
+                    // Clear the whole observed count only if it remained unchanged. If another
+                    // refresh request arrived during the scan, the count was incremented, the CAS
+                    // fails, and the next loop iteration performs another scan for that new
+                    // refresh request.
+                    pendingRefreshRequests.compareAndSet(observedRefreshRequests, 0);
                 }
             }
         }
     }
 
-    private void initialize(RowType valueRowType) throws Exception {
+    private void initializeLookupState(RowType valueRowType) throws Exception {
         Catalog newCatalog = null;
         IOManager newIOManager = null;
         LocalTableQuery newLocalTableQuery = null;

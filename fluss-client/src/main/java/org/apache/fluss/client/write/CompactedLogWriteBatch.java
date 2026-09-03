@@ -46,11 +46,13 @@ public final class CompactedLogWriteBatch extends AbstractRowLogWriteBatch<Compa
             int schemaId,
             int writeLimit,
             AbstractPagedOutputView outputView,
+            boolean isHistoricalPartition,
             long createdMs) {
         super(
                 tableId,
                 bucketId,
                 physicalTablePath,
+                isHistoricalPartition,
                 createdMs,
                 outputView,
                 MemoryLogRecordsCompactedBuilder.builder(schemaId, writeLimit, outputView, true),

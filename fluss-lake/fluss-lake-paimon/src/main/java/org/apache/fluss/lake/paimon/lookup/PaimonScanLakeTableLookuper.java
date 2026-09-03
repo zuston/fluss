@@ -120,6 +120,12 @@ public class PaimonScanLakeTableLookuper implements LakeTableLookuper {
         }
     }
 
+    @Override
+    public void requestRefresh() {
+        checkNotClosed();
+        // Every lookup plans a new scan against the latest snapshot; no registered file set exists.
+    }
+
     private List<Predicate> keyPredicates(BinaryRow key) {
         org.apache.paimon.types.RowType rowType = fileStoreTable.rowType();
         PredicateBuilder builder = new PredicateBuilder(rowType);

@@ -21,6 +21,7 @@ import org.apache.fluss.lake.paimon.tiering.RecordWriter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.LogRecord;
 
+import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.data.InternalRow;
 import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
@@ -41,7 +42,8 @@ public class AppendOnlyWriter extends RecordWriter<InternalRow> {
             FileStoreTable fileStoreTable,
             TableBucket tableBucket,
             @Nullable String partition,
-            List<String> partitionKeys) {
+            List<String> partitionKeys,
+            boolean historicalPartition) {
         //noinspection unchecked
         super(
                 (TableWriteImpl<InternalRow>)
@@ -50,18 +52,14 @@ public class AppendOnlyWriter extends RecordWriter<InternalRow> {
                 fileStoreTable.rowType(),
                 tableBucket,
                 partition,
-                partitionKeys); // Pass to parent
+                partitionKeys,
+                historicalPartition);
         this.fileStoreTable = fileStoreTable;
     }
 
     @Override
     public void write(LogRecord record) throws Exception {
-        flussRecordAsPaimonRow.setFlussRecord(record);
-
-        // get partition once
-        if (partition == null) {
-            partition = tableWrite.getPartition(flussRecordAsPaimonRow);
-        }
+        BinaryRow targetPartition = prepareRecordAndGetPartition(record);
 
         // hacky, call internal method tableWrite.getWrite() to support
         // to write to given partition, otherwise, it'll always extract a partition from Paimon row
@@ -71,6 +69,6 @@ public class AppendOnlyWriter extends RecordWriter<InternalRow> {
         if (fileStoreTable.store().bucketMode() == BucketMode.BUCKET_UNAWARE) {
             writtenBucket = 0;
         }
-        tableWrite.getWrite().write(partition, writtenBucket, flussRecordAsPaimonRow);
+        tableWrite.getWrite().write(targetPartition, writtenBucket, flussRecordAsPaimonRow);
     }
 }

@@ -39,6 +39,7 @@ public abstract class RecordWriter<T> implements AutoCloseable {
     protected final int bucket;
     protected final List<String> partitionKeys;
     @Nullable protected BinaryRow partition;
+    protected final boolean historicalPartition;
     protected final FlussRecordAsPaimonRow flussRecordAsPaimonRow;
 
     public RecordWriter(
@@ -46,11 +47,13 @@ public abstract class RecordWriter<T> implements AutoCloseable {
             RowType tableRowType,
             TableBucket tableBucket,
             @Nullable String partition,
-            List<String> partitionKeys) {
+            List<String> partitionKeys,
+            boolean historicalPartition) {
         this.tableWrite = tableWrite;
         this.tableRowType = tableRowType;
         this.bucket = tableBucket.getBucket();
         this.partitionKeys = partitionKeys;
+        this.historicalPartition = historicalPartition;
         // set partition to EMPTY_ROW in advance for non-partitioned table
         if (partition == null || partitionKeys.isEmpty()) {
             this.partition = BinaryRow.EMPTY_ROW;
@@ -61,16 +64,32 @@ public abstract class RecordWriter<T> implements AutoCloseable {
 
     public abstract void write(LogRecord record) throws Exception;
 
-    CommitMessage complete() throws Exception {
+    List<CommitMessage> complete() throws Exception {
         List<CommitMessage> commitMessages = tableWrite.prepareCommit();
-        checkState(
-                commitMessages.size() == 1,
-                "The size of CommitMessage must be 1, but got %s.",
-                commitMessages);
-        return commitMessages.get(0);
+        // A normal writer targets one fixed partition, while a historical writer may write to
+        // multiple original partitions and therefore produce multiple commit messages.
+        if (!historicalPartition) {
+            checkState(
+                    commitMessages.size() == 1,
+                    "The size of CommitMessage must be 1, but got %s.",
+                    commitMessages);
+        }
+        return commitMessages;
     }
 
     public void close() throws Exception {
         tableWrite.close();
+    }
+
+    /** Sets the current Fluss record and returns the Paimon partition it should be written to. */
+    protected BinaryRow prepareRecordAndGetPartition(LogRecord record) {
+        flussRecordAsPaimonRow.setFlussRecord(record);
+        if (historicalPartition) {
+            return tableWrite.getPartition(flussRecordAsPaimonRow);
+        }
+        if (partition == null) {
+            partition = tableWrite.getPartition(flussRecordAsPaimonRow);
+        }
+        return partition;
     }
 }

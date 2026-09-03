@@ -64,8 +64,9 @@ public class KvWriteBatch extends WriteBatch {
             AbstractPagedOutputView outputView,
             @Nullable int[] targetColumns,
             MergeMode mergeMode,
+            boolean isHistoricalPartition,
             long createdMs) {
-        super(tableId, bucketId, physicalTablePath, createdMs);
+        super(tableId, bucketId, physicalTablePath, isHistoricalPartition, createdMs);
         this.outputView = outputView;
         this.recordsBuilder =
                 KvRecordBatchBuilder.builder(schemaId, writeLimit, outputView, kvFormat);

@@ -127,6 +127,25 @@ class PaimonLocalTableQuery implements Closeable {
         }
     }
 
+    /** Refreshes every partition-bucket already registered with the local query. */
+    void refreshFilesFromLatestSnapshot() {
+        for (Map.Entry<PaimonPartitionBucket, BucketState> entry : bucketStates.entrySet()) {
+            PaimonPartitionBucket partitionBucket = entry.getKey();
+            BucketState bucketState = entry.getValue();
+            Object lockScope = fileRegistrationLock(bucketState);
+            synchronized (lockScope) {
+                List<DataFileMeta> currentFiles = bucketState.files;
+                if (currentFiles != null) {
+                    bucketState.files =
+                            registerFiles(
+                                    partitionBucket.getPartition(),
+                                    partitionBucket.getBucket(),
+                                    currentFiles);
+                }
+            }
+        }
+    }
+
     Object fileRegistrationLock(BucketState bucketState) {
         if (CONCURRENT_LOOKUP_SUPPORTED) {
             return bucketState;

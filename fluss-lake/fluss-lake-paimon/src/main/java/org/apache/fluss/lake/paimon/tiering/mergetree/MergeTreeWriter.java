@@ -22,6 +22,7 @@ import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.record.LogRecord;
 
 import org.apache.paimon.KeyValue;
+import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.disk.IOManager;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.sink.RowKeyExtractor;
@@ -48,7 +49,7 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
             TableBucket tableBucket,
             @Nullable String partition,
             List<String> partitionKeys) {
-        this(fileStoreTable, tableBucket, partition, partitionKeys, (String[]) null);
+        this(fileStoreTable, tableBucket, partition, partitionKeys, null, false);
     }
 
     public MergeTreeWriter(
@@ -57,7 +58,23 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
             @Nullable String partition,
             List<String> partitionKeys,
             @Nullable String[] ioTmpDirs) {
-        this(fileStoreTable, createIOManager(ioTmpDirs), tableBucket, partition, partitionKeys);
+        this(fileStoreTable, tableBucket, partition, partitionKeys, ioTmpDirs, false);
+    }
+
+    public MergeTreeWriter(
+            FileStoreTable fileStoreTable,
+            TableBucket tableBucket,
+            @Nullable String partition,
+            List<String> partitionKeys,
+            @Nullable String[] ioTmpDirs,
+            boolean historicalPartition) {
+        this(
+                fileStoreTable,
+                createIOManager(ioTmpDirs),
+                tableBucket,
+                partition,
+                partitionKeys,
+                historicalPartition);
     }
 
     MergeTreeWriter(
@@ -66,12 +83,23 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
             TableBucket tableBucket,
             @Nullable String partition,
             List<String> partitionKeys) {
+        this(fileStoreTable, ioManager, tableBucket, partition, partitionKeys, false);
+    }
+
+    MergeTreeWriter(
+            FileStoreTable fileStoreTable,
+            IOManager ioManager,
+            TableBucket tableBucket,
+            @Nullable String partition,
+            List<String> partitionKeys,
+            boolean historicalPartition) {
         super(
                 createTableWrite(fileStoreTable, ioManager),
                 fileStoreTable.rowType(),
                 tableBucket,
                 partition,
-                partitionKeys);
+                partitionKeys,
+                historicalPartition);
         this.rowKeyExtractor = fileStoreTable.createRowKeyExtractor();
         this.ioManager = ioManager;
     }
@@ -105,12 +133,7 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
 
     @Override
     public void write(LogRecord record) throws Exception {
-        flussRecordAsPaimonRow.setFlussRecord(record);
-
-        // get partition once
-        if (partition == null) {
-            partition = tableWrite.getPartition(flussRecordAsPaimonRow);
-        }
+        BinaryRow targetPartition = prepareRecordAndGetPartition(record);
 
         rowKeyExtractor.setRecord(flussRecordAsPaimonRow);
         keyValue.replace(
@@ -121,6 +144,6 @@ public class MergeTreeWriter extends RecordWriter<KeyValue> {
         // hacky, call internal method tableWrite.getWrite() to support
         // to write to given partition, otherwise, it'll always extract a partition from Paimon row
         // which may be costly
-        tableWrite.getWrite().write(partition, bucket, keyValue);
+        tableWrite.getWrite().write(targetPartition, bucket, keyValue);
     }
 }

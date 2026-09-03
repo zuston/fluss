@@ -47,11 +47,12 @@ abstract class AbstractRowLogWriteBatch<R> extends WriteBatch {
             long tableId,
             int bucketId,
             PhysicalTablePath physicalTablePath,
+            boolean isHistoricalPartition,
             long createdMs,
             AbstractPagedOutputView outputView,
             MemoryLogRecordsRowBuilder<R> recordsBuilder,
             String buildErrorMessage) {
-        super(tableId, bucketId, physicalTablePath, createdMs);
+        super(tableId, bucketId, physicalTablePath, isHistoricalPartition, createdMs);
         this.outputView = outputView;
         this.recordsBuilder = recordsBuilder;
         this.buildErrorMessage = buildErrorMessage;

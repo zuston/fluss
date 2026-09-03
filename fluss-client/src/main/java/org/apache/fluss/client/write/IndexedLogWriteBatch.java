@@ -45,11 +45,13 @@ public final class IndexedLogWriteBatch extends AbstractRowLogWriteBatch<Indexed
             int schemaId,
             int writeLimit,
             AbstractPagedOutputView outputView,
+            boolean isHistoricalPartition,
             long createdMs) {
         super(
                 tableId,
                 bucketId,
                 physicalTablePath,
+                isHistoricalPartition,
                 createdMs,
                 outputView,
                 MemoryLogRecordsIndexedBuilder.builder(schemaId, writeLimit, outputView, true),
