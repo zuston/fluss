@@ -1397,7 +1397,8 @@ public class ReplicaManager implements ServerReconfigurable {
                             lakeBucketOffsets.entrySet()) {
                         TableBucket tb = lakeBucketOffsetEntry.getKey();
                         LakeBucketOffset lakeBucketOffset = lakeBucketOffsetEntry.getValue();
-                        LogTablet logTablet = getReplicaOrException(tb).getLogTablet();
+                        Replica replica = getReplicaOrException(tb);
+                        LogTablet logTablet = replica.getLogTablet();
                         logTablet.updateLakeTableSnapshotId(lakeBucketOffset.getSnapshotId());
 
                         lakeBucketOffset
@@ -1411,6 +1412,11 @@ public class ReplicaManager implements ServerReconfigurable {
                         lakeBucketOffset
                                 .getMaxTimestamp()
                                 .ifPresent(logTablet::updateLakeMaxTimestamp);
+
+                        if (replica.isHistoricalPartition()) {
+                            historicalPartitionManager.requireLakeSnapshot(
+                                    tb.getTableId(), lakeBucketOffset.getSnapshotId());
+                        }
 
                         responseCallback.accept(new NotifyLakeTableOffsetResponse());
                     }

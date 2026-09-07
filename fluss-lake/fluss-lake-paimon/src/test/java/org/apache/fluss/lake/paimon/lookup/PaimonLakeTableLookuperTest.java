@@ -792,6 +792,52 @@ class PaimonLakeTableLookuperTest {
     }
 
     @Test
+    void testScanLookupUsesSpecifiedSnapshot() throws Exception {
+        TablePath tablePath = TablePath.of(DB, "scan_specified_snapshot");
+        Schema schema = pkSchema();
+        FileStoreTable table = createPaimonTable(tablePath, partitionedPkDescriptor(schema));
+        writeAndCommitData(
+                table,
+                Collections.singletonMap(
+                        0, Collections.singletonList(paimonRow(1, "20240101", "Alice"))));
+        long firstSnapshotId = table.latestSnapshot().get().id();
+
+        writeAndCommitData(
+                table,
+                Collections.singletonMap(
+                        0, Collections.singletonList(paimonRow(1, "20240101", "Updated"))));
+        long secondSnapshotId = table.latestSnapshot().get().id();
+        assertThat(secondSnapshotId).isNotEqualTo(firstSnapshotId);
+
+        try (LakeTableLookuper lookuper =
+                createLookuper(
+                        tablePath,
+                        tableConfig(KvFormat.COMPACTED, KV_FORMAT_VERSION_2),
+                        LookupMode.SCAN)) {
+            byte[] key = paimonKey(schema, 1, "20240101");
+            BinaryValue firstValue =
+                    decodeValue(
+                            lookuper.lookup(
+                                    key,
+                                    lookupContext(
+                                            schema, "20240101", 0, SCHEMA_ID, firstSnapshotId)),
+                            SCHEMA_ID,
+                            schema);
+            BinaryValue secondValue =
+                    decodeValue(
+                            lookuper.lookup(
+                                    key,
+                                    lookupContext(
+                                            schema, "20240101", 0, SCHEMA_ID, secondSnapshotId)),
+                            SCHEMA_ID,
+                            schema);
+
+            assertThat(firstValue.row.getString(2).toString()).isEqualTo("Alice");
+            assertThat(secondValue.row.getString(2).toString()).isEqualTo("Updated");
+        }
+    }
+
+    @Test
     void testScanLookupSeesNewSnapshotsAndMergesUpdatesAndDeletes() throws Exception {
         TablePath tablePath = TablePath.of(DB, "scan_latest_snapshot");
         Schema schema = pkSchema();
@@ -1005,6 +1051,18 @@ class PaimonLakeTableLookuperTest {
                 bucket,
                 schemaId,
                 schema.getRowType(),
+                NO_OP_LOOKUP_METRIC_RECORDER);
+    }
+
+    private static LakeTableLookuper.LookupContext lookupContext(
+            Schema schema, String partitionName, int bucket, short schemaId, long lakeSnapshotId) {
+        return new LakeTableLookuper.LookupContext(
+                ResolvedPartitionSpec.fromPartitionName(
+                        Collections.singletonList("dt"), partitionName),
+                bucket,
+                schemaId,
+                schema.getRowType(),
+                lakeSnapshotId,
                 NO_OP_LOOKUP_METRIC_RECORDER);
     }
 

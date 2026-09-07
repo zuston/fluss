@@ -184,6 +184,7 @@ class HistoricalLakeLookupManagerTest {
         lookup(manager, PARTITION_TABLE_INFO);
         assertThat(lookuper.closed).isFalse();
         assertThat(lookuper.refreshCount).isOne();
+        assertThat(lookuper.lookupContexts.get(1).lakeSnapshotId()).isEqualTo(10L);
         assertThat(manager.createdLookupers).containsExactly(lookuper);
 
         // Snapshot IDs are opaque; a numerically smaller ID may identify a newer snapshot.
@@ -191,6 +192,7 @@ class HistoricalLakeLookupManagerTest {
         lookup(manager, PARTITION_TABLE_INFO);
         assertThat(lookuper.closed).isFalse();
         assertThat(lookuper.refreshCount).isEqualTo(2);
+        assertThat(lookuper.lookupContexts.get(2).lakeSnapshotId()).isEqualTo(9L);
         assertThat(manager.createdLookupers).containsExactly(lookuper);
 
         manager.requireLakeSnapshot(PARTITION_TABLE_ID, 9L);

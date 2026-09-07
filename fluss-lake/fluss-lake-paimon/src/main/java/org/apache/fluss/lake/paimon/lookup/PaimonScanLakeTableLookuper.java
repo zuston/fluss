@@ -26,6 +26,7 @@ import org.apache.fluss.types.RowType;
 import org.apache.fluss.utils.ExceptionUtils;
 import org.apache.fluss.utils.IOUtils;
 
+import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
@@ -50,11 +51,12 @@ import static org.apache.fluss.lake.paimon.utils.PaimonConversions.toPaimon;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
 /**
- * Looks up a primary key by scanning the latest Paimon snapshot with a limit of one result.
+ * Looks up a primary key by scanning a requested Paimon snapshot with a limit of one result.
  *
- * <p>Each request has its own scan and reader, restricted to the requested partition, bucket, and
- * complete primary key. No local lookup files or partition-bucket file lists are cached. Close is
- * expected only after the owner has drained active lookups.
+ * <p>Each request has its own scan and reader, restricted to the requested snapshot, partition,
+ * bucket, and complete primary key. If no snapshot is requested, the latest one is used. No local
+ * lookup files or partition-bucket file lists are cached. Close is expected only after the owner
+ * has drained active lookups.
  */
 public class PaimonScanLakeTableLookuper implements LakeTableLookuper {
 
@@ -84,8 +86,18 @@ public class PaimonScanLakeTableLookuper implements LakeTableLookuper {
 
         long lookupStartNanos = System.nanoTime();
         try {
+            FileStoreTable scanTable = fileStoreTable;
+            Long lakeSnapshotId = context.lakeSnapshotId();
+            if (lakeSnapshotId != null) {
+                // Paimon propagates the table's snapshot and manifest caches to this copy.
+                scanTable =
+                        scanTable.copy(
+                                Collections.singletonMap(
+                                        CoreOptions.SCAN_SNAPSHOT_ID.key(),
+                                        String.valueOf(lakeSnapshotId)));
+            }
             ReadBuilder readBuilder =
-                    fileStoreTable
+                    scanTable
                             .newReadBuilder()
                             .withFilter(keyPredicates(rowConverter.getKey(key, context)))
                             .withProjection(rowConverter.valueProjection())
@@ -123,7 +135,8 @@ public class PaimonScanLakeTableLookuper implements LakeTableLookuper {
     @Override
     public void requestRefresh() {
         checkNotClosed();
-        // Every lookup plans a new scan against the latest snapshot; no registered file set exists.
+        // Every lookup plans a new scan against its requested snapshot; no registered file set
+        // exists.
     }
 
     private List<Predicate> keyPredicates(BinaryRow key) {

@@ -76,6 +76,7 @@ public interface LakeTableLookuper extends AutoCloseable {
         private final int bucketId;
         private final short schemaId;
         private final RowType valueRowType;
+        private final @Nullable Long lakeSnapshotId;
         private final LookupMetricRecorder lookupMetricRecorder;
 
         /**
@@ -93,10 +94,31 @@ public interface LakeTableLookuper extends AutoCloseable {
                 short schemaId,
                 RowType valueRowType,
                 LookupMetricRecorder lookupMetricRecorder) {
+            this(partitionSpec, bucketId, schemaId, valueRowType, null, lookupMetricRecorder);
+        }
+
+        /**
+         * Creates a lookup context targeting a specific lake snapshot.
+         *
+         * @param partitionSpec resolved Fluss partition spec for the lookup
+         * @param bucketId target bucket id in the lake table
+         * @param schemaId schema id to encode the returned Fluss value with
+         * @param valueRowType row type to encode the returned Fluss value with
+         * @param lakeSnapshotId lake snapshot to read, or null to let the lake storage choose
+         * @param lookupMetricRecorder recorder for lake table point lookup metrics
+         */
+        public LookupContext(
+                ResolvedPartitionSpec partitionSpec,
+                int bucketId,
+                short schemaId,
+                RowType valueRowType,
+                @Nullable Long lakeSnapshotId,
+                LookupMetricRecorder lookupMetricRecorder) {
             this.partitionSpec = checkNotNull(partitionSpec, "partitionSpec must not be null.");
             this.bucketId = bucketId;
             this.schemaId = schemaId;
             this.valueRowType = checkNotNull(valueRowType, "valueRowType must not be null.");
+            this.lakeSnapshotId = lakeSnapshotId;
             this.lookupMetricRecorder =
                     checkNotNull(lookupMetricRecorder, "lookupMetricRecorder must not be null.");
         }
@@ -119,6 +141,11 @@ public interface LakeTableLookuper extends AutoCloseable {
         /** Returns the row type to encode the returned Fluss value with. */
         public RowType valueRowType() {
             return valueRowType;
+        }
+
+        /** Returns the lake snapshot to read, or null when the lake storage should choose. */
+        public @Nullable Long lakeSnapshotId() {
+            return lakeSnapshotId;
         }
 
         /** Returns the recorder for lake table point lookup metrics. */
