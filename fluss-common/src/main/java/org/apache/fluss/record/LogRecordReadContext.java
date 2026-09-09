@@ -102,7 +102,7 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
             return createIndexedReadContext(rowType, schemaId, selectedFields, schemaGetter);
         } else if (logFormat == LogFormat.COMPACTED) {
             int[] selectedFields = projection.getProjection();
-            return createCompactedRowReadContext(rowType, schemaId, selectedFields);
+            return createCompactedRowReadContext(rowType, schemaId, selectedFields, schemaGetter);
         } else {
             throw new IllegalArgumentException("Unsupported log format: " + logFormat);
         }
@@ -174,6 +174,13 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
         return createCompactedRowReadContext(rowType, schemaId, selectedFields);
     }
 
+    /** Creates a COMPACTED read context with schema evolution support. */
+    public static LogRecordReadContext createCompactedRowReadContext(
+            RowType rowType, int schemaId, SchemaGetter schemaGetter) {
+        int[] selectedFields = IntStream.range(0, rowType.getFieldCount()).toArray();
+        return createCompactedRowReadContext(rowType, schemaId, selectedFields, schemaGetter);
+    }
+
     /**
      * Creates a LogRecordReadContext for INDEXED log format.
      *
@@ -199,10 +206,18 @@ public class LogRecordReadContext implements LogRecordBatch.ReadContext, AutoClo
      */
     public static LogRecordReadContext createCompactedRowReadContext(
             RowType rowType, int schemaId, int[] selectedFields) {
+        return createCompactedRowReadContext(rowType, schemaId, selectedFields, null);
+    }
+
+    private static LogRecordReadContext createCompactedRowReadContext(
+            RowType rowType,
+            int schemaId,
+            int[] selectedFields,
+            @Nullable SchemaGetter schemaGetter) {
         FieldGetter[] fieldGetters = buildProjectedFieldGetters(rowType, selectedFields);
         // for COMPACTED log format, the projection is NEVER push downed to the server side
         return new LogRecordReadContext(
-                LogFormat.COMPACTED, rowType, schemaId, null, fieldGetters, false, null);
+                LogFormat.COMPACTED, rowType, schemaId, null, fieldGetters, false, schemaGetter);
     }
 
     private LogRecordReadContext(

@@ -308,7 +308,7 @@ public class KvRecoverHelper {
                     currentRowType, currentSchemaId, schemaGetter);
         } else if (logFormat == LogFormat.COMPACTED) {
             return LogRecordReadContext.createCompactedRowReadContext(
-                    currentRowType, currentSchemaId);
+                    currentRowType, currentSchemaId, schemaGetter);
         } else {
             throw new UnsupportedOperationException("Unsupported log format: " + logFormat);
         }

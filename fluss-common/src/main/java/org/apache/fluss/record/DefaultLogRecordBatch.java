@@ -234,7 +234,8 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
                 return rowRecordIterator(
                         rowType, context.getOutputProjectedRow(schemaId), timestamp);
             case COMPACTED:
-                return compactedRowRecordIterator(rowType, timestamp);
+                return compactedRowRecordIterator(
+                        rowType, context.getOutputProjectedRow(schemaId), timestamp);
             default:
                 throw new IllegalArgumentException("Unsupported log format: " + logFormat);
         }
@@ -298,7 +299,7 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
     }
 
     private CloseableIterator<LogRecord> compactedRowRecordIterator(
-            RowType rowType, long timestamp) {
+            RowType rowType, @Nullable ProjectedRow outputProjection, long timestamp) {
         DataType[] fieldTypes = rowType.getChildren().toArray(new DataType[0]);
         return new LogRecordIterator() {
             int position = DefaultLogRecordBatch.this.position + recordBatchHeaderSize(magic);
@@ -311,7 +312,15 @@ public class DefaultLogRecordBatch implements LogRecordBatch {
                                 segment, position, baseOffset + rowId, timestamp, fieldTypes);
                 rowId++;
                 position += logRecord.getSizeInBytes();
-                return logRecord;
+                if (outputProjection == null) {
+                    return logRecord;
+                } else {
+                    return new GenericRecord(
+                            logRecord.logOffset(),
+                            logRecord.timestamp(),
+                            logRecord.getChangeType(),
+                            outputProjection.replaceRow(logRecord.getRow()));
+                }
             }
 
             @Override
