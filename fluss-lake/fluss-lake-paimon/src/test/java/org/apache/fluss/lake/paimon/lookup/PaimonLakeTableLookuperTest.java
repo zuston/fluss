@@ -792,6 +792,60 @@ class PaimonLakeTableLookuperTest {
     }
 
     @Test
+    void testScanLookupPadsNewTimestampForOlderSnapshot() throws Exception {
+        TablePath tablePath = TablePath.of(DB, "scan_schema_evolution_before_snapshot");
+        Schema oldSchema = pkSchema();
+        TableDescriptor oldDescriptor = partitionedPkDescriptor(oldSchema);
+        FileStoreTable oldTable = createPaimonTable(tablePath, oldDescriptor);
+        writeAndCommitData(
+                oldTable,
+                Collections.singletonMap(
+                        0, Collections.singletonList(paimonRow(1, "20240101", "Alice"))));
+        long oldSnapshotId = oldTable.latestSnapshot().get().id();
+
+        Schema newSchema =
+                Schema.newBuilder()
+                        .column("id", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .column("name", DataTypes.STRING())
+                        .column("expire_at", DataTypes.TIMESTAMP_LTZ(3))
+                        .primaryKey("id", "dt")
+                        .build();
+        TableDescriptor newDescriptor = partitionedPkDescriptor(newSchema);
+        lakeCatalog.alterTable(
+                tablePath,
+                Collections.singletonList(
+                        TableChange.addColumn(
+                                "expire_at",
+                                DataTypes.TIMESTAMP_LTZ(3),
+                                "expiration time",
+                                TableChange.ColumnPosition.last())),
+                new TestingLakeCatalogContext(oldDescriptor, newDescriptor));
+
+        try (LakeTableLookuper lookuper =
+                createLookuper(
+                        tablePath,
+                        tableConfig(KvFormat.COMPACTED, KV_FORMAT_VERSION_2),
+                        LookupMode.SCAN)) {
+            BinaryValue value =
+                    decodeValue(
+                            lookuper.lookup(
+                                    paimonKey(newSchema, 1, "20240101"),
+                                    lookupContext(
+                                            newSchema,
+                                            "20240101",
+                                            0,
+                                            EVOLVED_SCHEMA_ID,
+                                            oldSnapshotId)),
+                            EVOLVED_SCHEMA_ID,
+                            newSchema);
+
+            assertRow(value.row, 1, "20240101", "Alice");
+            assertThat(value.row.isNullAt(3)).isTrue();
+        }
+    }
+
+    @Test
     void testScanLookupUsesSpecifiedSnapshot() throws Exception {
         TablePath tablePath = TablePath.of(DB, "scan_specified_snapshot");
         Schema schema = pkSchema();

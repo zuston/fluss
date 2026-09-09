@@ -87,6 +87,9 @@ public class PaimonScanLakeTableLookuper implements LakeTableLookuper {
         long lookupStartNanos = System.nanoTime();
         try {
             FileStoreTable scanTable = fileStoreTable;
+            // Capture the current schema before an older snapshot replaces the table's row type.
+            org.apache.paimon.types.RowType readType =
+                    scanTable.rowType().project(context.valueRowType().getFieldNames());
             Long lakeSnapshotId = context.lakeSnapshotId();
             if (lakeSnapshotId != null) {
                 // Paimon propagates the table's snapshot and manifest caches to this copy.
@@ -100,7 +103,7 @@ public class PaimonScanLakeTableLookuper implements LakeTableLookuper {
                     scanTable
                             .newReadBuilder()
                             .withFilter(keyPredicates(rowConverter.getKey(key, context)))
-                            .withProjection(rowConverter.valueProjection())
+                            .withReadType(readType)
                             .withLimit(1);
             InnerTableScan scan =
                     ((InnerTableScan) readBuilder.newScan())
