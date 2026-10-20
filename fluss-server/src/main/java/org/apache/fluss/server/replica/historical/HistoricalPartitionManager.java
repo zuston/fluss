@@ -44,12 +44,14 @@ import org.apache.fluss.utils.concurrent.Scheduler;
 
 import javax.annotation.Nullable;
 
-import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 
@@ -65,18 +67,12 @@ public final class HistoricalPartitionManager implements AutoCloseable {
             Configuration conf,
             @Nullable PluginManager pluginManager,
             LocalDiskManager localDiskManager,
-            File dataDir,
-            long dataDirVolumeBytes,
-            Scheduler scheduler) {
+            Scheduler scheduler,
+            Executor maintenanceExecutor) {
         this(
                 new HistoricalPartitionTaskExecutor(conf),
                 new HistoricalLakeLookupManager(
-                        conf,
-                        pluginManager,
-                        localDiskManager,
-                        dataDir,
-                        dataDirVolumeBytes,
-                        scheduler));
+                        conf, pluginManager, localDiskManager, scheduler, maintenanceExecutor));
     }
 
     @VisibleForTesting
@@ -213,6 +209,11 @@ public final class HistoricalPartitionManager implements AutoCloseable {
     /** Returns the cumulative number of lookup files evicted by the shared disk-space budget. */
     public long fileCacheCapacityEvictions() {
         return lakeLookupManager.fileCacheCapacityEvictions();
+    }
+
+    /** Returns the per-volume gauges owned by the historical cache runtime. */
+    public Map<String, LongSupplier> cacheMetrics() {
+        return lakeLookupManager.cacheMetrics();
     }
 
     @VisibleForTesting

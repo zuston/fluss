@@ -32,6 +32,9 @@ import org.apache.fluss.utils.WrappingProxy;
 import javax.annotation.Nullable;
 
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.function.LongSupplier;
 
 /**
  * A wrapper around {@link LakeStoragePlugin} that ensures the plugin classloader is used for all
@@ -147,6 +150,15 @@ public class PluginLakeStorageWrapper implements LakeStoragePlugin {
                         inner.createLakeTableLookuperManager(ioTmpDir, options), loader);
             }
         }
+
+        @Override
+        public LakeTableLookuperManager createLakeTableLookuperManager(
+                LookupCacheOptions options, Executor maintenanceExecutor) {
+            try (TemporaryClassLoaderContext ignored = TemporaryClassLoaderContext.of(loader)) {
+                return new ClassLoaderFixingLakeTableLookuperManager(
+                        inner.createLakeTableLookuperManager(options, maintenanceExecutor), loader);
+            }
+        }
     }
 
     static class ClassLoaderFixingLakeTableLookuperManager
@@ -181,6 +193,33 @@ public class PluginLakeStorageWrapper implements LakeStoragePlugin {
             try (TemporaryClassLoaderContext ignored = TemporaryClassLoaderContext.of(loader)) {
                 return inner.fileCacheCapacityEvictions();
             }
+        }
+
+        @Override
+        public void checkDiskUsage() {
+            try (TemporaryClassLoaderContext ignored = TemporaryClassLoaderContext.of(loader)) {
+                inner.checkDiskUsage();
+            }
+        }
+
+        @Override
+        public Map<String, LongSupplier> cacheMetrics() {
+            try (TemporaryClassLoaderContext ignored = TemporaryClassLoaderContext.of(loader)) {
+                return inner.cacheMetrics();
+            }
+        }
+
+        @Override
+        public AutoCloseable retain() {
+            AutoCloseable lease;
+            try (TemporaryClassLoaderContext ignored = TemporaryClassLoaderContext.of(loader)) {
+                lease = inner.retain();
+            }
+            return () -> {
+                try (TemporaryClassLoaderContext ignored = TemporaryClassLoaderContext.of(loader)) {
+                    lease.close();
+                }
+            };
         }
 
         @Override

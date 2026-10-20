@@ -204,6 +204,7 @@ public class ReplicaManager implements ServerReconfigurable {
 
     private final TabletServerMetadataCache metadataCache;
     private final ExecutorService ioExecutor;
+    private boolean historicalCacheMetricsRegistered;
     private final ProjectionPushdownCache projectionsCache = new ProjectionPushdownCache();
     private final Lock replicaStateChangeLock = new ReentrantLock();
 
@@ -371,23 +372,16 @@ public class ReplicaManager implements ServerReconfigurable {
         this.ioExecutor = ioExecutor;
         this.minInSyncReplicas = conf.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER);
         this.scannerManager = checkNotNull(scannerManager, "scannerManager");
-        // Historical lookup cache capacity currently uses only the first data volume.
-        File dataDir = localDiskManager.dataDirs().get(0);
-        long dataDirVolumeBytes = Files.getFileStore(dataDir.toPath()).getTotalSpace();
         this.historicalPartitionManager =
                 new HistoricalPartitionManager(
-                        conf,
-                        pluginManager,
-                        localDiskManager,
-                        dataDir,
-                        dataDirVolumeBytes,
-                        scheduler);
+                        conf, pluginManager, localDiskManager, scheduler, ioExecutor);
 
         registerMetrics();
     }
 
     public void startup() {
         historicalPartitionManager.startup(scheduler);
+        registerHistoricalCacheMetrics();
 
         // start up ISR expiration thread.
         // A follower can log behind leader for up tp configOptions#LOG_REPLICA_MAX_LAG_TIME x 1.5
@@ -457,6 +451,7 @@ public class ReplicaManager implements ServerReconfigurable {
     @Override
     public void reconfigure(Configuration newConfig) {
         historicalPartitionManager.reconfigure(newConfig);
+        registerHistoricalCacheMetrics();
         int newMinInSyncReplicas =
                 newConfig.get(ConfigOptions.LOG_REPLICA_MIN_IN_SYNC_REPLICAS_NUMBER);
         if (newMinInSyncReplicas == minInSyncReplicas) {
@@ -518,6 +513,18 @@ public class ReplicaManager implements ServerReconfigurable {
                 MetricNames.DISK_USAGE_RATIO, localDiskManager::getLastDiskUsageRatio);
         serverMetricGroup.gauge(
                 MetricNames.DISK_WRITE_LOCKED, () -> localDiskManager.isDiskWriteLocked() ? 1 : 0);
+    }
+
+    private synchronized void registerHistoricalCacheMetrics() {
+        if (!historicalCacheMetricsRegistered) {
+            Map<String, java.util.function.LongSupplier> metrics =
+                    historicalPartitionManager.cacheMetrics();
+            if (!metrics.isEmpty()) {
+                MetricGroup group = serverMetricGroup.addGroup("historical");
+                metrics.forEach((name, value) -> group.gauge(name, value::getAsLong));
+                historicalCacheMetricsRegistered = true;
+            }
+        }
     }
 
     @VisibleForTesting

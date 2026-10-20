@@ -23,6 +23,10 @@ import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.metadata.TablePath;
 
 import java.time.Duration;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.function.LongSupplier;
 
 import static org.apache.fluss.utils.Preconditions.checkArgument;
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
@@ -64,6 +68,24 @@ public interface LakeTableLookuperManager extends AutoCloseable {
         return 0L;
     }
 
+    /** Samples disk health and schedules cache reclamation when a disk is under pressure. */
+    default void checkDiskUsage() {}
+
+    /** Returns runtime-owned gauges keyed by their names within the historical metric group. */
+    default Map<String, LongSupplier> cacheMetrics() {
+        return Collections.emptyMap();
+    }
+
+    /**
+     * Retains shared resources for a lookup batch, including gaps between its individual lookups.
+     *
+     * <p>The lease must be closed by the acquiring thread. Existing leases may finish after this
+     * manager is closed; new acquisitions must then be rejected by resource-owning implementations.
+     */
+    default AutoCloseable retain() {
+        return () -> {};
+    }
+
     /**
      * Immutable snapshot of the format-independent resource settings for a lookup runtime.
      *
@@ -74,6 +96,9 @@ public interface LakeTableLookuperManager extends AutoCloseable {
 
         private final long localCacheMaxBytes;
         private final Duration expireAfterAccess;
+        private final Map<String, Long> directoryMaxBytes;
+        private final double diskWriteLimitRatio;
+        private final double diskWriteRecoverRatio;
 
         /**
          * Creates runtime resource settings.
@@ -84,13 +109,62 @@ public interface LakeTableLookuperManager extends AutoCloseable {
          * @param expireAfterAccess positive idle expiration for individual cached lookup files
          */
         public LookupCacheOptions(long localCacheMaxBytes, Duration expireAfterAccess) {
-            checkArgument(localCacheMaxBytes > 0, "localCacheMaxBytes must be greater than 0.");
-            this.localCacheMaxBytes = localCacheMaxBytes;
+            this(
+                    Collections.emptyMap(),
+                    positiveBytes(localCacheMaxBytes),
+                    expireAfterAccess,
+                    1.0,
+                    0.8);
+        }
+
+        /**
+         * Creates per-volume settings. Each directory must belong to a distinct local volume.
+         *
+         * @param directoryMaxBytes cache roots and their positive resident-file budgets
+         * @param expireAfterAccess positive idle expiration
+         * @param diskWriteLimitRatio usage ratio at which cache writes stop; 1 disables this limit
+         * @param diskWriteRecoverRatio usage ratio at which cache writes resume
+         */
+        public LookupCacheOptions(
+                Map<String, Long> directoryMaxBytes,
+                Duration expireAfterAccess,
+                double diskWriteLimitRatio,
+                double diskWriteRecoverRatio) {
+            this(
+                    Collections.unmodifiableMap(
+                            new LinkedHashMap<>(
+                                    checkNotNull(directoryMaxBytes, "directoryMaxBytes"))),
+                    0L,
+                    expireAfterAccess,
+                    diskWriteLimitRatio,
+                    diskWriteRecoverRatio);
+        }
+
+        private LookupCacheOptions(
+                Map<String, Long> directoryMaxBytes,
+                long fallbackMaxBytes,
+                Duration expireAfterAccess,
+                double diskWriteLimitRatio,
+                double diskWriteRecoverRatio) {
+            long totalBytes = fallbackMaxBytes;
+            for (Map.Entry<String, Long> directory : directoryMaxBytes.entrySet()) {
+                checkArgument(!directory.getKey().trim().isEmpty(), "Cache directory is empty.");
+                totalBytes = Math.addExact(totalBytes, positiveBytes(directory.getValue()));
+            }
+            this.localCacheMaxBytes = totalBytes;
+            this.directoryMaxBytes = directoryMaxBytes;
             this.expireAfterAccess =
                     checkNotNull(expireAfterAccess, "expireAfterAccess must not be null.");
             checkArgument(
                     !expireAfterAccess.isNegative() && !expireAfterAccess.isZero(),
                     "expireAfterAccess must be greater than 0.");
+            checkArgument(
+                    diskWriteRecoverRatio > 0.0
+                            && diskWriteLimitRatio > diskWriteRecoverRatio
+                            && diskWriteLimitRatio <= 1.0,
+                    "Invalid disk write-limit and recovery ratios.");
+            this.diskWriteLimitRatio = diskWriteLimitRatio;
+            this.diskWriteRecoverRatio = diskWriteRecoverRatio;
         }
 
         /** Returns the runtime-wide disk-space budget for local caches, in bytes. */
@@ -101,6 +175,26 @@ public interface LakeTableLookuperManager extends AutoCloseable {
         /** Returns the idle expiration applied independently to each cached lookup file. */
         public Duration expireAfterAccess() {
             return expireAfterAccess;
+        }
+
+        /** Returns the per-volume cache roots and budgets, or an empty map for legacy callers. */
+        public Map<String, Long> directoryMaxBytes() {
+            return directoryMaxBytes;
+        }
+
+        /** Returns the high-water mark for cache writes. */
+        public double diskWriteLimitRatio() {
+            return diskWriteLimitRatio;
+        }
+
+        /** Returns the low-water mark for resuming cache writes. */
+        public double diskWriteRecoverRatio() {
+            return diskWriteRecoverRatio;
+        }
+
+        private static long positiveBytes(long bytes) {
+            checkArgument(bytes > 0, "localCacheMaxBytes must be greater than 0.");
+            return bytes;
         }
     }
 

@@ -21,7 +21,6 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
-import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.LakeStorageNotConfiguredException;
 import org.apache.fluss.lake.lakestorage.LakeStorage;
 import org.apache.fluss.lake.lakestorage.LakeStoragePlugin;
@@ -56,18 +55,26 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongSupplier;
 import java.util.stream.Stream;
 
 import static org.apache.fluss.server.utils.LakeStorageUtils.extractLakeProperties;
@@ -122,11 +129,10 @@ class HistoricalLakeLookupManager implements AutoCloseable {
     private final AtomicLong lookuperIdSequence;
     private final Cache<Long, CachedLakeTableLookuper> lakeTableLookupers;
     private final ConcurrentMap<Long, Long> requiredLakeSnapshotIds = new ConcurrentHashMap<>();
-    private final File historicalLookupCacheRootDir;
-    private final long dataDirVolumeBytes;
-    // TODO: Introduce a minimum lookup cache disk ratio (default 0.01). When disk usage is high,
-    // evict cached entries down to the minimum ratio instead of clearing the entire cache; allow
-    // the cache to grow back to the maximum ratio after disk usage recovers.
+    private final List<CacheVolume> cacheVolumes;
+    private volatile Set<File> availableCacheRoots;
+    private final ConcurrentMap<File, Long> sampledDiskSizes = new ConcurrentHashMap<>();
+    private final Executor maintenanceExecutor;
     private final Runnable diskWriteGuard;
 
     private volatile long lookupCacheMaxDiskBytes;
@@ -140,18 +146,16 @@ class HistoricalLakeLookupManager implements AutoCloseable {
             Configuration conf,
             @Nullable PluginManager pluginManager,
             LocalDiskManager localDiskManager,
-            File dataDir,
-            long dataDirVolumeBytes,
-            Scheduler scheduler) {
+            Scheduler scheduler,
+            Executor maintenanceExecutor) {
         this(
                 conf,
                 pluginManager,
-                dataDir,
-                dataDirVolumeBytes,
+                discoverCacheVolumes(localDiskManager.dataDirs()),
                 Ticker.systemTicker(),
                 createCacheScheduler(scheduler),
-                checkNotNull(localDiskManager, "localDiskManager must not be null.")
-                        ::ensureWritable);
+                localDiskManager::ensureWritable,
+                maintenanceExecutor);
     }
 
     @VisibleForTesting
@@ -163,14 +167,40 @@ class HistoricalLakeLookupManager implements AutoCloseable {
             Ticker ticker,
             com.github.benmanes.caffeine.cache.Scheduler cacheScheduler,
             Runnable diskWriteGuard) {
+        this(
+                conf,
+                pluginManager,
+                Collections.singletonList(
+                        new CacheVolume(
+                                FlussPaths.historicalLookupRootDir(dataDir),
+                                dataDirVolumeBytes,
+                                null)),
+                ticker,
+                cacheScheduler,
+                diskWriteGuard,
+                ForkJoinPool.commonPool());
+    }
+
+    private HistoricalLakeLookupManager(
+            Configuration conf,
+            @Nullable PluginManager pluginManager,
+            List<CacheVolume> cacheVolumes,
+            Ticker ticker,
+            com.github.benmanes.caffeine.cache.Scheduler cacheScheduler,
+            Runnable diskWriteGuard,
+            Executor maintenanceExecutor) {
         this.conf = checkNotNull(conf, "conf must not be null.");
         this.pluginManager = pluginManager;
-        this.historicalLookupCacheRootDir =
-                FlussPaths.historicalLookupRootDir(
-                        checkNotNull(dataDir, "dataDir must not be null."));
-        checkArgument(dataDirVolumeBytes > 0, "dataDirVolumeBytes must be greater than 0.");
-        this.dataDirVolumeBytes = dataDirVolumeBytes;
-        this.diskWriteGuard = checkNotNull(diskWriteGuard, "diskWriteGuard must not be null.");
+        this.cacheVolumes = cacheVolumes;
+        this.availableCacheRoots = new LinkedHashSet<>();
+        for (CacheVolume volume : cacheVolumes) {
+            availableCacheRoots.add(volume.root);
+        }
+        this.maintenanceExecutor = checkNotNull(maintenanceExecutor, "maintenanceExecutor");
+        this.diskWriteGuard =
+                cacheVolumes.size() > 1
+                        ? () -> {}
+                        : checkNotNull(diskWriteGuard, "diskWriteGuard must not be null.");
         this.lookupCacheMaxDiskBytes =
                 cacheBytes(
                         conf.get(
@@ -205,8 +235,7 @@ class HistoricalLakeLookupManager implements AutoCloseable {
     /**
      * Attempts to clean lookup cache files left by a previous TabletServer process.
      *
-     * <p>The cache root under this server's first data directory is removed and recreated before
-     * lookups are accepted.
+     * <p>Cache roots on all distinct data volumes are cleaned before accepting lookups.
      */
     void startup(Scheduler scheduler) {
         checkNotNull(scheduler, "scheduler must not be null.");
@@ -216,28 +245,52 @@ class HistoricalLakeLookupManager implements AutoCloseable {
             if (started) {
                 return;
             }
-            try {
-                FileUtils.deleteDirectory(historicalLookupCacheRootDir);
-            } catch (IOException e) {
-                LOG.warn(
-                        "Failed to clean historical lookup cache directory {}.",
-                        historicalLookupCacheRootDir,
-                        e);
+            Set<File> roots = new LinkedHashSet<>();
+            for (CacheVolume volume : cacheVolumes) {
+                try {
+                    for (File root : volume.roots) {
+                        if (volume.store != null
+                                && (!volume.store.equals(
+                                                Files.getFileStore(root.getParentFile().toPath()))
+                                        || (root.exists()
+                                                && !volume.store.equals(
+                                                        Files.getFileStore(root.toPath()))))) {
+                            throw new IOException(
+                                    "Cache volume mount identity changed before startup.");
+                        }
+                        FileUtils.deleteDirectory(root);
+                    }
+                    Files.createDirectories(volume.root.toPath());
+                    roots.add(volume.root);
+                } catch (IOException e) {
+                    LOG.warn(
+                            "Historical lookup cache root {} is unavailable; other volumes remain usable.",
+                            volume.root,
+                            e);
+                }
             }
-            try {
-                Files.createDirectories(historicalLookupCacheRootDir.toPath());
-            } catch (IOException e) {
-                throw new FlussRuntimeException(
-                        "Failed to create historical lookup cache directory: "
-                                + historicalLookupCacheRootDir,
-                        e);
-            }
+            availableCacheRoots = Collections.unmodifiableSet(roots);
+            lookupCacheMaxDiskBytes =
+                    cacheBytes(
+                            conf.get(
+                                    ConfigOptions
+                                            .SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO));
             lookuperManager = createLookuperManager(conf);
             scheduler.schedule(
                     LOOKUP_CACHE_DISK_SIZE_TASK_NAME,
                     this::updateLookupCacheDiskSize,
                     0L,
                     LOOKUP_CACHE_DISK_SIZE_CHECK_INTERVAL.toMillis());
+            scheduler.schedule(
+                    "historical-lookup-cache-disk-monitor",
+                    () -> {
+                        LakeTableLookuperManager manager = lookuperManager;
+                        if (manager != null) {
+                            manager.checkDiskUsage();
+                        }
+                    },
+                    0L,
+                    conf.get(ConfigOptions.SERVER_DATA_DISK_CHECK_INTERVAL).toMillis());
             started = true;
         } finally {
             lifecycleLock.writeLock().unlock();
@@ -262,15 +315,32 @@ class HistoricalLakeLookupManager implements AutoCloseable {
                         schemaInfo,
                         originalPartitionSpec,
                         checkedMetricRecorder);
-        CachedLakeTableLookuper cachedLookuper = acquireLookuper(context, tableInfo);
+        CachedLakeTableLookuper cachedLookuper;
+        AutoCloseable resources;
+        lifecycleLock.readLock().lock();
         try {
-            List<byte[]> values = new ArrayList<>(lookupData.keys().size());
-            for (byte[] key : lookupData.keys()) {
-                values.add(cachedLookuper.lookuper.lookup(key, context.lookupContext));
+            checkState(!closed, "Historical lake lookup manager is closed.");
+            LakeTableLookuperManager manager = lookuperManager;
+            resources = manager == null ? () -> {} : manager.retain();
+            try {
+                cachedLookuper = acquireLookuper(context, tableInfo);
+            } catch (RuntimeException | Error e) {
+                IOUtils.closeQuietly(resources, "historical lookup resource lease");
+                throw e;
             }
-            return values;
         } finally {
-            cachedLookuper.release();
+            lifecycleLock.readLock().unlock();
+        }
+        try (AutoCloseable ignored = resources) {
+            try {
+                List<byte[]> values = new ArrayList<>(lookupData.keys().size());
+                for (byte[] key : lookupData.keys()) {
+                    values.add(cachedLookuper.lookuper.lookup(key, context.lookupContext));
+                }
+                return values;
+            } finally {
+                cachedLookuper.release();
+            }
         }
     }
 
@@ -319,6 +389,11 @@ class HistoricalLakeLookupManager implements AutoCloseable {
         return manager == null ? 0L : manager.fileCacheCapacityEvictions();
     }
 
+    Map<String, LongSupplier> cacheMetrics() {
+        LakeTableLookuperManager manager = lookuperManager;
+        return manager == null ? Collections.emptyMap() : manager.cacheMetrics();
+    }
+
     @VisibleForTesting
     boolean hasLookuperManager() {
         return lookuperManager != null;
@@ -359,8 +434,17 @@ class HistoricalLakeLookupManager implements AutoCloseable {
             if (started && lakeConfigChanged && lookuperManager == null) {
                 lookuperManager = createLookuperManager(newConf);
             }
-            if ((cacheLimitChanged || expirationChanged) && lookuperManager != null) {
-                lookuperManager.reconfigure(new LookupCacheOptions(newMaxDiskBytes, newExpiration));
+            if (lookuperManager != null
+                    && (cacheLimitChanged
+                            || expirationChanged
+                            || !Objects.equals(
+                                    conf.get(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO),
+                                    newConf.get(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO))
+                            || !Objects.equals(
+                                    conf.get(ConfigOptions.SERVER_DATA_DISK_WRITE_RECOVER_RATIO),
+                                    newConf.get(
+                                            ConfigOptions.SERVER_DATA_DISK_WRITE_RECOVER_RATIO)))) {
+                lookuperManager.reconfigure(cacheOptions(newConf));
             }
             // Publish the configuration before its version. A lookup that observes the new version
             // must also observe the matching configuration snapshot.
@@ -469,12 +553,7 @@ class HistoricalLakeLookupManager implements AutoCloseable {
         LakeStorage lakeStorage =
                 lakeStoragePlugin.createLakeStorage(Configuration.fromMap(lakeProperties));
         return lakeStorage.createLakeTableLookuperManager(
-                historicalLookupCacheRootDir.getAbsolutePath(),
-                new LookupCacheOptions(
-                        lookupCacheMaxDiskBytes,
-                        configuration.get(
-                                ConfigOptions
-                                        .SERVER_HISTORICAL_PARTITION_LOOKUPER_CACHE_EXPIRE_AFTER_ACCESS)));
+                cacheOptions(configuration), maintenanceExecutor);
     }
 
     private static boolean hasLakeConfigChanged(Configuration currentConf, Configuration newConf) {
@@ -486,9 +565,54 @@ class HistoricalLakeLookupManager implements AutoCloseable {
 
     private long cacheBytes(double ratio) {
         checkArgument(ratio > 0.0 && ratio <= 1.0, "ratio must be within (0.0, 1.0].");
-        long totalCacheBytes =
-                Math.min(dataDirVolumeBytes, (long) Math.ceil(dataDirVolumeBytes * ratio));
-        return Math.max(1L, totalCacheBytes);
+        long bytes = 0L;
+        for (CacheVolume volume : cacheVolumes) {
+            if (availableCacheRoots.contains(volume.root)) {
+                bytes = Math.addExact(bytes, volume.cacheBytes(ratio));
+            }
+        }
+        return bytes;
+    }
+
+    private LookupCacheOptions cacheOptions(Configuration configuration) {
+        double ratio =
+                configuration.get(
+                        ConfigOptions.SERVER_HISTORICAL_PARTITION_LOOKUP_CACHE_MAX_DISK_RATIO);
+        Map<String, Long> budgets = new LinkedHashMap<>();
+        for (CacheVolume volume : cacheVolumes) {
+            if (availableCacheRoots.contains(volume.root)) {
+                budgets.put(volume.root.getAbsolutePath(), volume.cacheBytes(ratio));
+            }
+        }
+        return new LookupCacheOptions(
+                budgets,
+                configuration.get(
+                        ConfigOptions
+                                .SERVER_HISTORICAL_PARTITION_LOOKUPER_CACHE_EXPIRE_AFTER_ACCESS),
+                configuration.get(ConfigOptions.SERVER_DATA_DISK_WRITE_LIMIT_RATIO),
+                configuration.get(ConfigOptions.SERVER_DATA_DISK_WRITE_RECOVER_RATIO));
+    }
+
+    private static List<CacheVolume> discoverCacheVolumes(List<File> dataDirs) {
+        Map<FileStore, CacheVolume> volumes = new LinkedHashMap<>();
+        for (File dataDir : dataDirs) {
+            try {
+                FileStore store = Files.getFileStore(dataDir.toPath());
+                if (!volumes.containsKey(store)) {
+                    volumes.put(
+                            store,
+                            new CacheVolume(
+                                    FlussPaths.historicalLookupRootDir(dataDir),
+                                    store.getTotalSpace(),
+                                    store));
+                } else {
+                    volumes.get(store).roots.add(FlussPaths.historicalLookupRootDir(dataDir));
+                }
+            } catch (IOException | IllegalArgumentException e) {
+                LOG.warn("Could not discover historical lookup cache volume for {}.", dataDir, e);
+            }
+        }
+        return new ArrayList<>(volumes.values());
     }
 
     private static String cacheNamespace(
@@ -505,22 +629,32 @@ class HistoricalLakeLookupManager implements AutoCloseable {
     }
 
     private void updateLookupCacheDiskSize() {
-        if (!historicalLookupCacheRootDir.exists()) {
-            lookupCacheDiskSize = 0L;
-            return;
+        for (CacheVolume volume : cacheVolumes) {
+            for (File root : volume.roots) {
+                if (!root.exists()) {
+                    continue;
+                }
+                try {
+                    if (volume.store != null
+                            && !volume.store.equals(Files.getFileStore(root.toPath()))) {
+                        throw new IOException("Cache volume mount identity changed.");
+                    }
+                    try (Stream<Path> paths = Files.walk(root.toPath())) {
+                        sampledDiskSizes.put(
+                                root,
+                                paths.filter(Files::isRegularFile)
+                                        .mapToLong(HistoricalLakeLookupManager::fileSize)
+                                        .sum());
+                    }
+                } catch (IOException | UncheckedIOException e) {
+                    LOG.warn(
+                            "Failed to sample historical lookup cache {}; keeping its previous size.",
+                            root,
+                            e);
+                }
+            }
         }
-        try (Stream<Path> paths = Files.walk(historicalLookupCacheRootDir.toPath())) {
-            lookupCacheDiskSize =
-                    paths.filter(Files::isRegularFile)
-                            .mapToLong(HistoricalLakeLookupManager::fileSize)
-                            .sum();
-        } catch (IOException | UncheckedIOException e) {
-            LOG.warn(
-                    "Failed to calculate historical lookup cache usage under {}. Keeping the last sampled value of {} bytes.",
-                    historicalLookupCacheRootDir,
-                    lookupCacheDiskSize,
-                    e);
-        }
+        lookupCacheDiskSize = sampledDiskSizes.values().stream().mapToLong(Long::longValue).sum();
     }
 
     private static long fileSize(Path path) {
@@ -604,6 +738,25 @@ class HistoricalLakeLookupManager implements AutoCloseable {
             this.schemaId = schemaId;
             this.tablePath = tablePath;
             this.lookupContext = lookupContext;
+        }
+    }
+
+    private static final class CacheVolume {
+        private final File root;
+        private final List<File> roots = new ArrayList<>();
+        private final long totalBytes;
+        private final @Nullable FileStore store;
+
+        private CacheVolume(File root, long totalBytes, @Nullable FileStore store) {
+            checkArgument(totalBytes > 0L, "dataDirVolumeBytes must be greater than 0.");
+            this.root = root;
+            this.roots.add(root);
+            this.totalBytes = totalBytes;
+            this.store = store;
+        }
+
+        private long cacheBytes(double ratio) {
+            return Math.max(1L, Math.min(totalBytes, (long) Math.ceil(totalBytes * ratio)));
         }
     }
 

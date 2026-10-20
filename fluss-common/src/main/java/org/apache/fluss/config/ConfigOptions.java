@@ -428,8 +428,8 @@ public class ConfigOptions {
                             .doubleType()
                             .defaultValue(0.10)
                             .withDescription(
-                                    "The maximum fraction of the total capacity of the volume containing the first available data directory allocated to historical partition lookup caches on a TabletServer. "
-                                            + "All table lookupers share this capacity, with eviction at file granularity. Historical lookup cache files are stored under that data directory; additional data volumes are not used. "
+                                    "The maximum fraction of each distinct local data volume allocated to historical partition lookup caches on a TabletServer. "
+                                            + "All table lookupers share these budgets, with eviction at file granularity. Cache files are distributed across the available data volumes, and multiple data directories on the same volume share one budget. "
                                             + "The valid range is (0.0, 1.0].");
 
     public static final ConfigOption<Duration>

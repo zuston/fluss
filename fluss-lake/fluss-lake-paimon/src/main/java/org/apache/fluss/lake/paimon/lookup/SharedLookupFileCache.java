@@ -29,12 +29,15 @@ import org.apache.paimon.shade.caffeine2.com.github.benmanes.caffeine.cache.Tick
 
 import javax.annotation.Nullable;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 
 import static org.apache.fluss.utils.Preconditions.checkNotNull;
 import static org.apache.paimon.mergetree.LookupUtils.fileKibiBytes;
@@ -45,6 +48,7 @@ public final class SharedLookupFileCache implements AutoCloseable {
 
     private final Cache<Key, LookupFile> cache;
     private final AtomicLong capacityEvictions = new AtomicLong();
+    private final BiConsumer<LookupFile, RemovalCause> fileRemoval;
 
     /** Creates a shared lookup-file cache. */
     public SharedLookupFileCache(Duration fileRetention, MemorySize maxDiskSize) {
@@ -53,12 +57,38 @@ public final class SharedLookupFileCache implements AutoCloseable {
 
     @VisibleForTesting
     SharedLookupFileCache(Duration fileRetention, MemorySize maxDiskSize, Ticker ticker) {
+        this(
+                fileRetention,
+                maxDiskSize,
+                ticker,
+                (file, cause) -> {
+                    try {
+                        file.close(cause);
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                });
+    }
+
+    SharedLookupFileCache(
+            Duration fileRetention,
+            MemorySize maxDiskSize,
+            BiConsumer<LookupFile, RemovalCause> fileRemoval) {
+        this(fileRetention, maxDiskSize, Ticker.systemTicker(), fileRemoval);
+    }
+
+    private SharedLookupFileCache(
+            Duration fileRetention,
+            MemorySize maxDiskSize,
+            Ticker ticker,
+            BiConsumer<LookupFile, RemovalCause> fileRemoval) {
         checkNotNull(fileRetention, "fileRetention must not be null.");
         checkNotNull(maxDiskSize, "maxDiskSize must not be null.");
+        this.fileRemoval = checkNotNull(fileRemoval, "fileRemoval");
         this.cache =
                 Caffeine.newBuilder()
                         .expireAfterAccess(fileRetention)
-                        .maximumWeight(Math.max(1L, maxDiskSize.getKibiBytes()))
+                        .maximumWeight(cacheWeight(maxDiskSize))
                         .weigher(
                                 (Key key, LookupFile lookupFile) ->
                                         Math.max(1, fileKibiBytes(lookupFile.localFile())))
@@ -74,7 +104,7 @@ public final class SharedLookupFileCache implements AutoCloseable {
 
     /** Updates the maximum cache weight. */
     public void updateMaxDiskSize(MemorySize maxDiskSize) {
-        cache.policy().eviction().get().setMaximum(Math.max(1L, maxDiskSize.getKibiBytes()));
+        cache.policy().eviction().get().setMaximum(cacheWeight(maxDiskSize));
     }
 
     /** Updates idle expiration without replacing cached lookup files. */
@@ -96,17 +126,66 @@ public final class SharedLookupFileCache implements AutoCloseable {
         cache.cleanUp();
     }
 
+    void evictDirectory(File directory, long bytesToFree) {
+        if (bytesToFree <= 0) {
+            return;
+        }
+        Map<Key, LookupFile> coldFiles =
+                cache.policy()
+                        .eviction()
+                        .get()
+                        .coldest((int) Math.min(Integer.MAX_VALUE, cache.estimatedSize()));
+        long removedBytes = 0;
+        for (Map.Entry<Key, LookupFile> entry : coldFiles.entrySet()) {
+            LookupFile file = entry.getValue();
+            if (file.localFile().toPath().startsWith(directory.toPath())) {
+                long bytes = file.localFile().length();
+                if (cache.asMap().remove(entry.getKey(), file)) {
+                    capacityEvictions.incrementAndGet();
+                    removedBytes += bytes;
+                }
+                if (removedBytes >= bytesToFree) {
+                    break;
+                }
+            }
+        }
+    }
+
+    void invalidateDirectory(File directory) {
+        cache.asMap()
+                .forEach(
+                        (key, file) -> {
+                            if (file.localFile().toPath().startsWith(directory.toPath())) {
+                                cache.asMap().remove(key, file);
+                            }
+                        });
+    }
+
+    void invalidateFile(File localFile) {
+        cache.asMap()
+                .forEach(
+                        (key, file) -> {
+                            if (file.localFile().equals(localFile)) {
+                                cache.asMap().remove(key, file);
+                            }
+                        });
+    }
+
+    void discard(LookupFile lookupFile) {
+        removeLookupFile(null, lookupFile, RemovalCause.EXPLICIT);
+    }
+
+    private static long cacheWeight(MemorySize size) {
+        return size.getBytes() == 0 ? 0 : Math.max(1L, size.getKibiBytes());
+    }
+
     private void removeLookupFile(
             @Nullable Key key, @Nullable LookupFile lookupFile, RemovalCause cause) {
         if (lookupFile != null) {
             if (cause == RemovalCause.SIZE) {
                 capacityEvictions.incrementAndGet();
             }
-            try {
-                lookupFile.close(cause);
-            } catch (IOException e) {
-                throw new UncheckedIOException(e);
-            }
+            fileRemoval.accept(lookupFile, cause);
         }
     }
 

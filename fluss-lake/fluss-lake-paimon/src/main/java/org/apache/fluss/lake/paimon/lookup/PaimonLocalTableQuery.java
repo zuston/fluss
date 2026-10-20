@@ -33,13 +33,11 @@ import org.apache.paimon.fs.FileIO;
 import org.apache.paimon.io.DataFileMeta;
 import org.apache.paimon.io.KeyValueFileReaderFactory;
 import org.apache.paimon.io.cache.CacheManager;
-import org.apache.paimon.lookup.LookupStoreFactory;
 import org.apache.paimon.mergetree.Levels;
 import org.apache.paimon.mergetree.LookupFile;
 import org.apache.paimon.mergetree.LookupLevels;
 import org.apache.paimon.mergetree.lookup.LookupSerializerFactory;
 import org.apache.paimon.mergetree.lookup.PersistValueProcessor;
-import org.apache.paimon.mergetree.lookup.RemoteLookupFileManager;
 import org.apache.paimon.operation.metrics.PartialLookupMetrics;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.reader.RecordReader;
@@ -54,10 +52,12 @@ import org.apache.paimon.utils.Preconditions;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
@@ -87,7 +87,8 @@ final class PaimonLocalTableQuery implements TableQuery {
 
     private final KeyValueFileReaderFactory.Builder readerFactoryBuilder;
 
-    private final LookupStoreFactory lookupStoreFactory;
+    private final LookupFileIO lookupStoreFactory;
+    private final DiskAwareIOManager sharedIOManager;
 
     private final int startLevel;
 
@@ -104,11 +105,10 @@ final class PaimonLocalTableQuery implements TableQuery {
     @Nullable private PartialLookupMetrics partialLookupMetrics;
 
     PaimonLocalTableQuery(
-            FileStoreTable table,
-            SharedLookupFileCache sharedLookupFileCache,
-            String cacheNamespace) {
+            FileStoreTable table, DiskAwareIOManager sharedIOManager, String cacheNamespace) {
         this.options = table.coreOptions();
-        this.lookupFileCache = sharedLookupFileCache.namespaced(cacheNamespace);
+        this.sharedIOManager = sharedIOManager;
+        this.lookupFileCache = sharedIOManager.fileCache().namespaced(cacheNamespace);
         this.tableView = new ConcurrentHashMap<>();
         FileStore<?> tableStore = table.store();
         if (!(tableStore instanceof KeyValueFileStore)) {
@@ -124,7 +124,8 @@ final class PaimonLocalTableQuery implements TableQuery {
         RowType keyType = readerFactoryBuilder.keyType();
         this.keyComparatorSupplier = new KeyComparatorSupplier(readerFactoryBuilder.keyType());
         this.lookupStoreFactory =
-                LookupStoreFactory.create(
+                new LookupFileIO(
+                        sharedIOManager,
                         options,
                         new CacheManager(
                                 options.lookupCacheMaxMemory(),
@@ -167,7 +168,7 @@ final class PaimonLocalTableQuery implements TableQuery {
 
         RowType readValueType = readerFactoryBuilder.readValueType();
         LookupLevels<KeyValue> lookupLevels =
-                new LookupLevels<>(
+                new LookupLevels<KeyValue>(
                         schemaId -> readValueType,
                         0L,
                         levels,
@@ -192,7 +193,77 @@ final class PaimonLocalTableQuery implements TableQuery {
                                         .getPathFile(),
                         lookupStoreFactory,
                         bloomFilterBuilderFactory(options),
-                        lookupFileCache);
+                        lookupFileCache) {
+                    private final ConcurrentMap<String, LookupFile> ownedFiles =
+                            new ConcurrentHashMap<>();
+
+                    @Override
+                    public LookupFile createLookupFile(DataFileMeta file) throws IOException {
+                        while (true) {
+                            DiskAwareIOManager.Allocation allocation;
+                            try {
+                                allocation = sharedIOManager.allocate(file.fileName(), ownedFiles);
+                            } catch (DiskAwareIOManager.CacheDiskIOException e) {
+                                if (!sharedIOManager.retry(e)) {
+                                    throw e;
+                                }
+                                continue;
+                            }
+                            LookupFile lookupFile = null;
+                            DiskAwareIOManager.CacheDiskIOException failure;
+                            try {
+                                lookupFile = super.createLookupFile(file);
+                                allocation.lookupFile = lookupFile;
+                                ownedFiles.put(file.fileName(), lookupFile);
+                                return lookupFile;
+                            } catch (DiskAwareIOManager.CacheDiskIOException e) {
+                                failure = e;
+                            } catch (UncheckedIOException e) {
+                                if (!(e.getCause()
+                                        instanceof DiskAwareIOManager.CacheDiskIOException)) {
+                                    throw e;
+                                }
+                                failure = (DiskAwareIOManager.CacheDiskIOException) e.getCause();
+                            } catch (IOException e) {
+                                if (allocation.outputOpened) {
+                                    throw e;
+                                }
+                                // File.createNewFile runs in Paimon before either output path
+                                // opens.
+                                failure = allocation.failure(e, false);
+                            } finally {
+                                if (lookupFile == null) {
+                                    allocation.abort();
+                                }
+                                sharedIOManager.finishAllocation(allocation);
+                            }
+                            if (!sharedIOManager.retry(failure)) {
+                                throw failure;
+                            }
+                        }
+                    }
+
+                    @Override
+                    public void addLocalFile(DataFileMeta file, LookupFile lookupFile) {
+                        if (sharedIOManager.admit(lookupFile)) {
+                            super.addLocalFile(file, lookupFile);
+                        } else {
+                            sharedIOManager.fileCache().discard(lookupFile);
+                        }
+                    }
+
+                    @Override
+                    public void close() {
+                        // Paimon's filename-only ownership callback cannot track replacement
+                        // instances.
+                        ownedFiles.forEach(
+                                (name, file) -> {
+                                    sharedIOManager.closeLookupFile(file);
+                                    lookupFileCache.asMap().remove(name, file);
+                                });
+                        ownedFiles.clear();
+                    }
+                };
 
         // Optimization - download lookup files if already persisted to object store
         // We download these files if three conditions are met
@@ -208,12 +279,8 @@ final class PaimonLocalTableQuery implements TableQuery {
         if (this.options.lookupRemoteFileEnabled()
                 && !this.options.deletionVectorsEnabled()
                 && fullValueRead) {
-            // Calling the constructor tells `lookupLevels` to load remote files
-            new RemoteLookupFileManager<>(
-                    fileIO,
-                    factory.pathFactory(),
-                    lookupLevels,
-                    this.options.lookupRemoteLevelThreshold());
+            lookupLevels.setRemoteFileDownloader(
+                    lookupStoreFactory.downloader(fileIO, factory.pathFactory()));
         }
 
         return lookupLevels;

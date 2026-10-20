@@ -23,6 +23,9 @@ import org.apache.fluss.lake.source.LakeSource;
 import org.apache.fluss.lake.writer.LakeTieringFactory;
 import org.apache.fluss.metadata.TablePath;
 
+import java.util.Map;
+import java.util.concurrent.Executor;
+
 /**
  * The LakeStorage interface defines how to implement lakehouse storage system such as Paimon and
  * Iceberg. It provides a method to create a lake tiering factory.
@@ -63,5 +66,23 @@ public interface LakeStorage {
             String ioTmpDir, LookupCacheOptions options) {
         throw new UnsupportedOperationException(
                 "Point lookup is not supported for this lake storage.");
+    }
+
+    /**
+     * Creates a lookuper manager using the per-volume roots in the supplied options.
+     *
+     * @param options per-volume cache budgets and write-protection settings
+     * @param maintenanceExecutor executor for disk checks and cache cleanup
+     * @return the lookuper manager
+     */
+    default LakeTableLookuperManager createLakeTableLookuperManager(
+            LookupCacheOptions options, Executor maintenanceExecutor) {
+        if (options.directoryMaxBytes().size() == 1) {
+            Map.Entry<String, Long> directory =
+                    options.directoryMaxBytes().entrySet().iterator().next();
+            return createLakeTableLookuperManager(directory.getKey(), options);
+        }
+        throw new UnsupportedOperationException(
+                "Multi-disk point lookup is not supported for this lake storage.");
     }
 }
